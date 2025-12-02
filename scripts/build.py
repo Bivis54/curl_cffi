@@ -11,7 +11,7 @@ from urllib.request import urlretrieve
 from cffi import FFI
 
 # this is the upstream libcurl-impersonate version
-__version__ = "1.2.5"
+__version__ = "1.2.5-bivis"
 
 
 def detect_arch():
@@ -61,7 +61,7 @@ def download_libcurl():
     sysname = "linux-" + arch["libc"] if arch["system"] == "Linux" else arch["sysname"]
 
     url = (
-        f"https://github.com/lexiforest/curl-impersonate/releases/download/"
+        f"https://github.com/Bivis54/curl-impersonate/releases/download/"
         f"v{__version__}/libcurl-impersonate-v{__version__}"
         f".{arch['so_arch']}-{sysname}.tar.gz"
     )
