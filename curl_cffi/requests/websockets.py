@@ -166,6 +166,8 @@ class WebSocket(BaseWebSocket):
         "skip_utf8_validation",
         "_emitters",
         "keep_running",
+        "_inflate_decompressor",  # for permessage-deflate (RFC 7692)
+        "_pmdeflate_enabled",     # compatibility flag for user code
     )
 
     def __init__(
@@ -197,6 +199,8 @@ class WebSocket(BaseWebSocket):
         super().__init__(curl=curl, autoclose=autoclose, debug=debug)
         self.skip_utf8_validation = skip_utf8_validation
         self.keep_running = False
+        self._inflate_decompressor = None  # for permessage-deflate (RFC 7692)
+        self._pmdeflate_enabled = True     # patched libcurl supports permessage-deflate
 
         self._emitters: dict[EventTypeLiteral, Callable] = {}
         if on_open:
@@ -540,6 +544,18 @@ class WebSocket(BaseWebSocket):
                 if "message" in self._emitters:
                     # Concatenate collected chunks with the final message
                     msg = b"".join(chunks)
+
+                    # Decompress if permessage-deflate (RFC 7692) - DEFLATE flag set
+                    if flags & CurlWsFlag.DEFLATE:
+                        import zlib
+                        if self._inflate_decompressor is None:
+                            self._inflate_decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                        try:
+                            # Add deflate trailer and decompress
+                            msg = self._inflate_decompressor.decompress(msg + b"\x00\x00\xff\xff")
+                        except zlib.error:
+                            # If decompression fails, pass data as-is
+                            pass
 
                     if (flags & CurlWsFlag.TEXT) and not self.skip_utf8_validation:
                         try:

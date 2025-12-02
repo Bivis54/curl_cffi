@@ -589,6 +589,8 @@ class CurlWsFlag(IntEnum):
     CLOSE = 1 << 3
     PING = 1 << 4
     OFFSET = 1 << 5
+    PONG = 1 << 6
+    DEFLATE = 1 << 7  # permessage-deflate compression (RFC 7692)
 
 
 class CurlSslVersion(IntEnum):
