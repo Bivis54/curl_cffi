@@ -544,19 +544,20 @@ class WebSocket(BaseWebSocket):
                 if "message" in self._emitters:
                     # Concatenate collected chunks with the final message
                     msg = b"".join(chunks)
-
-                    # Decompress if permessage-deflate (RFC 7692) - DEFLATE flag set
+                    # Decompress if permessage-deflate (RFC 7692)
                     if flags & CurlWsFlag.DEFLATE:
                         import zlib
                         if self._inflate_decompressor is None:
-                            self._inflate_decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                            self._inflate_decompressor = zlib.decompressobj(
+                                -zlib.MAX_WBITS
+                            )
                         try:
-                            # Add deflate trailer and decompress
-                            msg = self._inflate_decompressor.decompress(msg + b"\x00\x00\xff\xff")
+                            trailer = b"\x00\x00\xff\xff"
+                            msg = self._inflate_decompressor.decompress(
+                                msg + trailer
+                            )
                         except zlib.error:
-                            # If decompression fails, pass data as-is
-                            pass
-
+                            pass  # Decompression failed, use raw data
                     if (flags & CurlWsFlag.TEXT) and not self.skip_utf8_validation:
                         try:
                             msg = msg.decode()  # type: ignore
