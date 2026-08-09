@@ -8,6 +8,7 @@ import asyncio
 import struct
 import threading
 import warnings
+import zlib
 from asyncio import InvalidStateError
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import suppress
@@ -215,6 +216,7 @@ class WebSocket(BaseWebSocket):
         "skip_utf8_validation",
         "_emitters",
         "keep_running",
+        "_inflator",
     )
 
     def __init__(
@@ -246,6 +248,10 @@ class WebSocket(BaseWebSocket):
         super().__init__(curl=curl, autoclose=autoclose, debug=debug)
         self.skip_utf8_validation: bool = skip_utf8_validation
         self.keep_running: bool = False
+        # Lazily created inflater for permessage-deflate. Kept for the whole
+        # connection because the extension shares the LZ77 window between
+        # messages unless the server asked for no_context_takeover.
+        self._inflator = None
 
         self._emitters: dict[EventTypeLiteral, Callable[..., object]] = {}
         if on_open:
@@ -430,6 +436,31 @@ class WebSocket(BaseWebSocket):
 
         return chunk, frame
 
+    def _inflate(self, msg: bytes, flags: int) -> bytes:
+        """Inflate a permessage-deflate payload (RFC 7692).
+
+        Only frames that actually carried RSV1 are touched, so this is a no-op
+        unless the extension was negotiated. Negotiating it is up to the caller:
+        the ``Sec-WebSocket-Extensions`` header must be supplied with the
+        handshake headers, because its position and value are part of the
+        browser fingerprint and cannot be guessed by the library.
+        """
+        if not (flags & CurlWsFlag.DEFLATE):
+            return msg
+        if self._inflator is None:
+            self._inflator = zlib.decompressobj(-zlib.MAX_WBITS)
+        try:
+            return self._inflator.decompress(msg + b"\x00\x00\xff\xff")
+        except zlib.error as e:
+            # The deflate stream is shared across messages, so one bad frame
+            # desynchronises everything after it. Fail loudly instead of handing
+            # back garbage: the caller can reconnect with a clean inflater.
+            self._inflator = None
+            raise WebSocketError(
+                f"permessage-deflate: failed to inflate payload: {e}",
+                WsCloseCode.INVALID_DATA,
+            ) from e
+
     def recv(self) -> tuple[bytes, int]:
         """
         Receive a frame as bytes. libcurl splits frames into fragments, so we have to
@@ -465,7 +496,7 @@ class WebSocket(BaseWebSocket):
                 else:
                     raise
 
-        return b"".join(chunks), flags
+        return self._inflate(b"".join(chunks), flags), flags
 
     def recv_str(self) -> str:
         """Receive a text frame."""
@@ -612,7 +643,7 @@ class WebSocket(BaseWebSocket):
                 # Avoid unnecessary computation
                 if "message" in self._emitters:
                     # Concatenate collected chunks with the final message
-                    msg = b"".join(chunks)
+                    msg = self._inflate(b"".join(chunks), flags)
 
                     if (flags & CurlWsFlag.TEXT) and not self.skip_utf8_validation:
                         try:
