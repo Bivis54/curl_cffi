@@ -49,6 +49,12 @@ if TYPE_CHECKING:
     RECV_QUEUE_ITEM = tuple[bytes, int]
     SEND_QUEUE_ITEM = tuple[bytes | bytearray | memoryview, CurlWsFlag | int]
 
+# include/curl/websockets.h. curl >= 8.21.0 queues its auto-PONG in ws->pending
+# and only flushes it at the end of curl_ws_recv(); a reader that sees nothing
+# but a PING returns earlier with CURLE_AGAIN, so the PONG is never sent and the
+# server drops us on its ping timeout. We disable it and reply ourselves.
+CURLWS_NOAUTOPONG = 1 << 1
+
 
 @dataclass
 class WebSocketRetryStrategy:
@@ -411,6 +417,7 @@ class WebSocket(BaseWebSocket):
 
         # Magic number defined in: https://curl.se/docs/websocket.html
         _ = curl.setopt(CurlOpt.CONNECT_ONLY, 2)
+        _ = curl.setopt(CurlOpt.WS_OPTIONS, CURLWS_NOAUTOPONG)
         curl.perform()
         return self
 
@@ -421,6 +428,14 @@ class WebSocket(BaseWebSocket):
             raise WebSocketClosed("WebSocket is already closed")
 
         chunk, frame = self.curl.ws_recv()
+
+        if frame.flags & CurlWsFlag.PING:
+            # RFC 6455 5.5.3: a pong must echo the ping payload.
+            try:
+                _ = self.send(chunk, CurlWsFlag.PONG)
+            except Exception:  # noqa: BLE001
+                # Already broken; the next read or write reports it.
+                pass
 
         if frame.flags & CurlWsFlag.CLOSE:
             try:
@@ -635,6 +650,10 @@ class WebSocket(BaseWebSocket):
                 chunk, frame = self.recv_fragment()
                 flags = frame.flags
                 self._emit("data", chunk, frame)
+
+                # Control frames are not part of the message being reassembled.
+                if flags & (CurlWsFlag.PING | CurlWsFlag.PONG):
+                    continue
 
                 chunks.append(chunk)
                 if not (frame.bytesleft == 0 and flags & CurlWsFlag.CONT == 0):
@@ -1500,6 +1519,14 @@ class AsyncWebSocket(BaseWebSocket):
                 flags: int = frame.flags
                 if recv_error_retries > 0:
                     recv_error_retries = 0
+
+                # See CURLWS_NOAUTOPONG: libcurl no longer answers pings for us.
+                if flags & CurlWsFlag.PING:
+                    try:
+                        self._send_queue.put_nowait((chunk, CurlWsFlag.PONG))
+                    except asyncio.QueueFull:
+                        pass
+                    continue
 
                 # Data Frames (Text / Binary / Cont)
                 if flags & data_mask:
