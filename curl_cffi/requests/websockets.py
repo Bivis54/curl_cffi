@@ -430,12 +430,10 @@ class WebSocket(BaseWebSocket):
         chunk, frame = self.curl.ws_recv()
 
         if frame.flags & CurlWsFlag.PING:
-            # RFC 6455 5.5.3: a pong must echo the ping payload.
-            try:
+            # RFC 6455 5.5.3: a pong must echo the ping payload. A failure here
+            # means the connection is already broken; the next read reports it.
+            with suppress(Exception):
                 _ = self.send(chunk, CurlWsFlag.PONG)
-            except Exception:  # noqa: BLE001
-                # Already broken; the next read or write reports it.
-                pass
 
         if frame.flags & CurlWsFlag.CLOSE:
             try:
@@ -1522,10 +1520,8 @@ class AsyncWebSocket(BaseWebSocket):
 
                 # See CURLWS_NOAUTOPONG: libcurl no longer answers pings for us.
                 if flags & CurlWsFlag.PING:
-                    try:
+                    with suppress(asyncio.QueueFull):
                         self._send_queue.put_nowait((chunk, CurlWsFlag.PONG))
-                    except asyncio.QueueFull:
-                        pass
                     continue
 
                 # Data Frames (Text / Binary / Cont)
