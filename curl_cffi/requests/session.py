@@ -66,6 +66,7 @@ from .streams import (
 )
 from .utils import NOT_SET, HttpVersionLiteral, NotSetType, set_curl_options
 from .websockets import (
+    CURLWS_NOAUTOPONG,
     AsyncWebSocket,
     AsyncWebSocketContext,
     WebSocket,
@@ -1321,6 +1322,7 @@ class AsyncSession(BaseSession[R]):
                 CurlOpt.CONNECT_ONLY,
                 2,  # https://curl.se/docs/websocket.html
             )
+            _ = curl.setopt(CurlOpt.WS_OPTIONS, CURLWS_NOAUTOPONG)
 
             try:
                 _ = await self.loop.run_in_executor(None, curl.perform)
