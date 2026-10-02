@@ -14,7 +14,7 @@ from urllib.request import urlretrieve
 from cffi import FFI
 
 # this is the upstream libcurl-impersonate version
-__version__ = "2.1.0-ws2"
+__version__ = "2.1.0-ws4"
 
 
 def is_android_env() -> bool:
