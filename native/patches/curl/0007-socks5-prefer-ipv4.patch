@@ -1,0 +1,25 @@
+socks: prefer IPv4 destinations for locally resolved SOCKS5 targets
+
+diff --git a/lib/socks.c b/lib/socks.c
+index 8f6cf60..35a5cd1 100644
+--- a/lib/socks.c
++++ b/lib/socks.c
+@@ -972,12 +972,15 @@ static CURLproxycode socks5_resolving(struct socks_ctx *sx,
+     return CURLPX_OK;
+   }
+ 
++  /* curl-impersonate: the proxy gets a single address and cannot fall back,
++   * and many SOCKS5 proxies have no IPv6 egress. Prefer IPv4 unless IPv6 was
++   * asked for. */
++  if(data->set.ipver != CURL_IPRESOLVE_V6)
++    ai = Curl_conn_dns_get_ai(data, sx->dest, cf->sockindex, AF_INET, 0);
+ #ifdef USE_IPV6
+-  if(data->set.ipver != CURL_IPRESOLVE_V4)
++  if(!ai && (data->set.ipver != CURL_IPRESOLVE_V4))
+     ai = Curl_conn_dns_get_ai(data, sx->dest, cf->sockindex, AF_INET6, 0);
+ #endif
+-  if(!ai)
+-    ai = Curl_conn_dns_get_ai(data, sx->dest, cf->sockindex, AF_INET, 0);
+ 
+   if(!ai) {
+     failf(data, "Failed to resolve \"%s\" for SOCKS5 connect.",
