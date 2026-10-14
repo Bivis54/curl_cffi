@@ -361,6 +361,12 @@ class CurlOpt(IntEnum):
     HTTP3_SSL_PERMUTE_EXTENSIONS = 0 + 1039
     TLS_TRUST_ANCHORS = 10000 + 1040
     QUIC_INITIAL_PACKET_NUMBER = 0 + 1041
+    # Options of the fork's libcurl-impersonate patches (native/patches/curl)
+    QUIC_MAX_UDP_PAYLOAD_SIZE = 0 + 1100
+    HTTP3_GREASE_FRAME = 0 + 1101
+    HTTP3_PRIORITY_UPDATE = 0 + 1102
+    HTTP3_EARLYDATA = 0 + 1103
+    QUIC_ADDRESS_TOKEN = 0 + 1104
 
     if locals().get("WRITEDATA"):
         FILE = locals().get("WRITEDATA")
