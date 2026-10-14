@@ -1,0 +1,117 @@
+impersonate: chrome152 target (Windows, trust anchor IDs, QUIC parity options)
+
+diff --git a/lib/impersonate.c b/lib/impersonate.c
+index aad5688..922d39f 100644
+--- a/lib/impersonate.c
++++ b/lib/impersonate.c
+@@ -1043,6 +1043,110 @@ const struct impersonate_opts impersonations[] = {
+     .split_cookies = true,
+     .form_boundary = "webkit",
+   },
++  {
++    .target = "chrome152",
++    .alias = "chrome152",
++    .quic_initial_packet_number = 1,
++    /* Chrome sends 1250 byte datagrams and does not probe the path MTU. */
++    .quic_max_udp_payload_size = 1250,
++    .http3_grease_frame = true,
++    .http3_priority_update = true,
++    .http3_earlydata = true,
++    .quic_address_token = true,
++    .httpversion = CURL_HTTP_VERSION_2_0,
++    .ssl_version = CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_DEFAULT,
++    .ciphers =
++      "TLS_AES_128_GCM_SHA256:"
++      "TLS_AES_256_GCM_SHA384:"
++      "TLS_CHACHA20_POLY1305_SHA256:"
++      "ECDHE-ECDSA-AES128-GCM-SHA256:"
++      "ECDHE-RSA-AES128-GCM-SHA256:"
++      "ECDHE-ECDSA-AES256-GCM-SHA384:"
++      "ECDHE-RSA-AES256-GCM-SHA384:"
++      "ECDHE-ECDSA-CHACHA20-POLY1305:"
++      "ECDHE-RSA-CHACHA20-POLY1305:"
++      "ECDHE-RSA-AES128-SHA:"
++      "ECDHE-RSA-AES256-SHA:"
++      "AES128-GCM-SHA256:"
++      "AES256-GCM-SHA384:"
++      "AES128-SHA:"
++      "AES256-SHA",
++    .curves = "X25519MLKEM768:X25519:P-256:P-384",
++    .sig_hash_algs =
++      "mldsa44:"
++      "mldsa65:"
++      "mldsa87:"
++      "ecdsa_secp256r1_sha256:"
++      "rsa_pss_rsae_sha256:"
++      "rsa_pkcs1_sha256:"
++      "ecdsa_secp384r1_sha384:"
++      "rsa_pss_rsae_sha384:"
++      "rsa_pkcs1_sha384:"
++      "rsa_pss_rsae_sha512:"
++      "rsa_pkcs1_sha512",
++    .http3_sig_hash_algs =
++      "ecdsa_secp256r1_sha256:"
++      "rsa_pss_rsae_sha256:"
++      "rsa_pkcs1_sha256:"
++      "ecdsa_secp384r1_sha384:"
++      "rsa_pss_rsae_sha384:"
++      "rsa_pkcs1_sha384:"
++      "rsa_pss_rsae_sha512:"
++      "rsa_pkcs1_sha512:"
++      "rsa_pkcs1_sha1",
++    .npn = false,
++    .alpn = true,
++    .alps = true,
++    .tls_permute_extensions = true,
++    .tls_session_ticket = true,
++    .cert_compression = "brotli",
++    .http_headers = {
++      "sec-ch-ua: \"Chromium\";v=\"152\", \"Not?A_Brand\";v=\"24\", \"Google Chrome\";v=\"152\"",
++      "sec-ch-ua-mobile: ?0",
++      "sec-ch-ua-platform: \"Windows\"",
++      "Upgrade-Insecure-Requests: 1",
++      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
++      "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
++      "Sec-Fetch-Site: none",
++      "Sec-Fetch-Mode: navigate",
++      "Sec-Fetch-User: ?1",
++      "Sec-Fetch-Dest: document",
++      "Accept-Encoding: gzip, deflate, br, zstd",
++      "Accept-Language: en-US,en;q=0.9",
++      "Priority: u=0, i"
++    },
++    .http2_settings = "1:65536;2:0;4:6291456;6:262144",
++    .http2_window_update = 15663105,
++    .http2_stream_weight = 256,
++    .http2_stream_exclusive = 1,
++    .http3_settings = "1:65536;6:262144;7:100;51:1;GREASE",
++    .http3_pseudo_headers_order = "masp",
++    .quic_cid_length = "webkit",
++    /* initial_rtt (12583) carries the RTT of the last connection to the
++       server and is left out before there is one. */
++    .quic_transport_parameters = "1:30000;3:1472;4:15728640;5:6291456;6:6291456;7:6291456;8:100;9:103;15:;17:1@1,GREASE;32:65536;12583:CACHED;12584:0x4f524947;GREASE",
++    /* Over QUIC, extensions left out of this list are not sent at all,
++       trust anchors (51764) included. early_data (42) is only sent when
++       resuming with 0-RTT, pre_shared_key always comes last. */
++    .http3_tls_extension_order = "0-10-13-16-27-42-43-45-51-57-17613-51764-65037",
++    .ech = "true",
++    .tls_extension_order = NULL,
++    .tls_use_new_alps_codepoint = true,
++    .tls_signed_cert_timestamps = true,
++    .tls_grease = true,
++    .split_cookies = true,
++    .form_boundary = "webkit",
++    /* Trust Anchor IDs (extension 0xca34): Chrome sends this set by
++       default since 141. Captured from Chrome 152 on Windows; the wire
++       order is shuffled per connection. */
++    .tls_trust_anchors =
++      "11129.9.1,11129.9.4,11129.9.5,11129.9.6,11129.9.7,11129.9.8,"
++      "11129.9.10,11129.9.11,11129.9.12,11129.9.13,11129.9.15,44947.2.1,"
++      "44947.2.6,44947.2.13,44947.2.14,44947.2.15,44947.2.18,44947.2.19,"
++      "44947.2.20,52580.200109.1.7,52580.200109.1.8,52580.200109.1.9,"
++      "52580.200109.1.10,52580.200109.1.11,52580.200109.1.12,"
++      "52580.200109.1.13,52580.200109.1.18,52580.200109.1.19",
++  },
+   {
+     .target = "chrome99",
+     .alias = "chrome99",
