@@ -1,0 +1,87 @@
+name: QUIC fingerprint bench
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/**
+    paths:
+      - .github/workflows/quic-bench.yaml
+      - tests/quic_bench/**
+
+permissions:
+  contents: read
+
+jobs:
+  chrome:
+    name: Chrome reference (${{ matrix.chrome }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        chrome: [cft-154, cft-152, preinstalled]
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install Chrome
+      id: chrome
+      run: |
+        set -euo pipefail
+        if [[ "${{ matrix.chrome }}" == "preinstalled" ]]; then
+          echo "path=$(command -v google-chrome)" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        milestone="${{ matrix.chrome }}"
+        milestone="${milestone#cft-}"
+        url=$(curl -sSL https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone-with-downloads.json \
+          | python -c "import json,sys; d=json.load(sys.stdin)['milestones']['$milestone']; print([x['url'] for x in d['downloads']['chrome'] if x['platform']=='linux64'][0])")
+        echo "Downloading $url"
+        curl -sSL -o chrome.zip "$url"
+        unzip -q chrome.zip -d "$RUNNER_TEMP/cft"
+        echo "path=$RUNNER_TEMP/cft/chrome-linux64/chrome" >> "$GITHUB_OUTPUT"
+
+    - name: Capture
+      run: |
+        pip install playwright
+        python -m playwright install-deps chromium > /dev/null
+        python tests/quic_bench/capture_chrome.py --chrome "${{ steps.chrome.outputs.path }}" \
+          --out snapshots --label "chrome-${{ matrix.chrome }}"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: snapshot-chrome-${{ matrix.chrome }}
+        path: snapshots/
+
+  curl_cffi:
+    name: curl_cffi baseline (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fork-chrome152-2
+            spec: https://github.com/Bivis54/curl_cffi/releases/download/chrome152-2/curl_cffi-0.16.1b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+          - name: upstream-0.16.4b1
+            spec: curl_cffi==0.16.4b1
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Capture
+      run: |
+        python -m venv /tmp/venv
+        /tmp/venv/bin/pip install "${{ matrix.spec }}"
+        cd /tmp
+        /tmp/venv/bin/python "$GITHUB_WORKSPACE/tests/quic_bench/capture_curl_cffi.py" \
+          --out "$GITHUB_WORKSPACE/snapshots" --label "${{ matrix.name }}"
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: snapshot-${{ matrix.name }}
+        path: snapshots/
