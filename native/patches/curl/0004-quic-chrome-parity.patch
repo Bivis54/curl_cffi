@@ -1,10 +1,10 @@
-quic: Chrome parity options (datagram size, HTTP/3 GREASE and PRIORITY_UPDATE, 0-RTT with BoringSSL, address tokens, cached initial_rtt)
+quic: Chrome parity options (datagram size, HTTP/3 GREASE and PRIORITY_UPDATE, 0-RTT with BoringSSL, address tokens, cached initial_rtt, Chromium-like GREASE transport parameter and version information) and TLS signature_algorithms GREASE over TCP
 
 diff --git a/include/curl/curl.h b/include/curl/curl.h
-index 5e05a77..8b98a1d 100644
+index 5e05a77..d380462 100644
 --- a/include/curl/curl.h
 +++ b/include/curl/curl.h
-@@ -2458,6 +2458,27 @@ typedef enum {
+@@ -2458,6 +2458,31 @@ typedef enum {
     * randomized distribution; non-negative values select a fixed number. */
    CURLOPT(CURLOPT_QUIC_INITIAL_PACKET_NUMBER, CURLOPTTYPE_LONG, 1041),
  
@@ -29,14 +29,18 @@ index 5e05a77..8b98a1d 100644
 +   * NEW_TOKEN frames and present them in the next Initial packets. */
 +  CURLOPT(CURLOPT_QUIC_ADDRESS_TOKEN, CURLOPTTYPE_LONG, 1104),
 +
++  /* curl-impersonate (fork): GREASE the signature_algorithms extension of
++   * TLS over TCP, as Chrome does since 150. */
++  CURLOPT(CURLOPT_TLS_GREASE_SIGALGS, CURLOPTTYPE_LONG, 1105),
++
    CURLOPT_LASTENTRY /* the last unused */
  } CURLoption;
  
 diff --git a/lib/easy.c b/lib/easy.c
-index d37fa18..c78f094 100644
+index d37fa18..3277e1f 100644
 --- a/lib/easy.c
 +++ b/lib/easy.c
-@@ -550,6 +550,31 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
+@@ -550,6 +550,36 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
    if(ret)
      return ret;
  
@@ -65,11 +69,16 @@ index d37fa18..c78f094 100644
 +  if(ret)
 +    return ret;
 +
++  ret = curl_easy_setopt(data, CURLOPT_TLS_GREASE_SIGALGS,
++                         (long)opts->tls_grease_sigalgs);
++  if(ret)
++    return ret;
++
    if(opts->quic_transport_parameters) {
      ret = curl_easy_setopt(data, CURLOPT_QUIC_TRANSPORT_PARAMETERS,
                             opts->quic_transport_parameters);
 diff --git a/lib/easyoptions.c b/lib/easyoptions.c
-index 78a0f2e..fdaa9e6 100644
+index 78a0f2e..f441535 100644
 --- a/lib/easyoptions.c
 +++ b/lib/easyoptions.c
 @@ -142,9 +142,12 @@ const struct curl_easyoption Curl_easyopts[] = {
@@ -98,19 +107,27 @@ index 78a0f2e..fdaa9e6 100644
    { "QUIC_TRANSPORT_PARAMETERS", CURLOPT_QUIC_TRANSPORT_PARAMETERS,
      CURLOT_STRING, 0 },
    { "QUOTE", CURLOPT_QUOTE, CURLOT_SLIST, 0 },
-@@ -445,6 +451,6 @@ const struct curl_easyoption Curl_easyopts[] = {
+@@ -396,6 +402,7 @@ const struct curl_easyoption Curl_easyopts[] = {
+     CURLOT_STRING, 0 },
+   { "TLS_EXTENSION_ORDER", CURLOPT_TLS_EXTENSION_ORDER, CURLOT_STRING, 0 },
+   { "TLS_GREASE", CURLOPT_TLS_GREASE, CURLOT_LONG, 0 },
++  { "TLS_GREASE_SIGALGS", CURLOPT_TLS_GREASE_SIGALGS, CURLOT_LONG, 0 },
+   { "TLS_KEY_SHARES_LIMIT", CURLOPT_TLS_KEY_SHARES_LIMIT, CURLOT_LONG, 0 },
+   { "TLS_KEY_USAGE_NO_CHECK", CURLOPT_TLS_KEY_USAGE_NO_CHECK,
+     CURLOT_LONG, 0 },
+@@ -445,6 +452,6 @@ const struct curl_easyoption Curl_easyopts[] = {
   */
  int Curl_easyopts_check(void)
  {
 -  return (CURLOPT_LASTENTRY % 10000) != (1041 + 1);
-+  return (CURLOPT_LASTENTRY % 10000) != (1104 + 1);
++  return (CURLOPT_LASTENTRY % 10000) != (1105 + 1);
  }
  #endif
 diff --git a/lib/impersonate.h b/lib/impersonate.h
-index e36ec5a..b0a5d07 100644
+index e36ec5a..d2b168c 100644
 --- a/lib/impersonate.h
 +++ b/lib/impersonate.h
-@@ -52,6 +52,11 @@ struct impersonate_opts {
+@@ -52,6 +52,12 @@ struct impersonate_opts {
    const char *http3_settings;
    const char *quic_cid_length;
    long quic_initial_packet_number;
@@ -119,14 +136,15 @@ index e36ec5a..b0a5d07 100644
 +  bool http3_priority_update;
 +  bool http3_earlydata;
 +  bool quic_address_token;
++  bool tls_grease_sigalgs;
    const char *quic_transport_parameters;
    bool tls_permute_extensions;
    bool tls_use_new_alps_codepoint;
 diff --git a/lib/setopt.c b/lib/setopt.c
-index 4d4e6cc..21fe590 100644
+index 4d4e6cc..0838e64 100644
 --- a/lib/setopt.c
 +++ b/lib/setopt.c
-@@ -1215,6 +1215,24 @@ static CURLcode setopt_long_http(struct Curl_easy *data, CURLoption option,
+@@ -1215,6 +1215,27 @@ static CURLcode setopt_long_http(struct Curl_easy *data, CURLoption option,
        return CURLE_BAD_FUNCTION_ARGUMENT;
      s->quic_initial_packet_number = arg;
      break;
@@ -148,14 +166,17 @@ index 4d4e6cc..21fe590 100644
 +  case CURLOPT_QUIC_ADDRESS_TOKEN:
 +    s->quic_address_token = !!arg;
 +    break;
++  case CURLOPT_TLS_GREASE_SIGALGS:
++    s->tls_grease_sigalgs = !!arg;
++    break;
    case CURLOPT_EXPECT_100_TIMEOUT_MS:
      result = value_range(&arg, 0, 0, 0xffff);
      if(!result)
 diff --git a/lib/urldata.h b/lib/urldata.h
-index 0ec0fff..853b03e 100644
+index 0ec0fff..0fd5fde 100644
 --- a/lib/urldata.h
 +++ b/lib/urldata.h
-@@ -1194,6 +1194,11 @@ struct UserDefined {
+@@ -1194,6 +1194,12 @@ struct UserDefined {
    int tls_record_size_limit;
    int tls_key_shares_limit;
    long quic_initial_packet_number;
@@ -164,11 +185,12 @@ index 0ec0fff..853b03e 100644
 +  BIT(http3_priority_update);
 +  BIT(http3_earlydata);
 +  BIT(quic_address_token);
++  BIT(tls_grease_sigalgs);
    BIT(http2_no_priority);
    BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
    BIT(post301); /* keep POSTs as POSTs after a 301 request */
 diff --git a/lib/vquic/cf-ngtcp2-cmn.c b/lib/vquic/cf-ngtcp2-cmn.c
-index ba5339a..552fce8 100644
+index ba5339a..a23d15b 100644
 --- a/lib/vquic/cf-ngtcp2-cmn.c
 +++ b/lib/vquic/cf-ngtcp2-cmn.c
 @@ -88,6 +88,10 @@ void Curl_cf_ngtcp2_h3_stream_ctx_free(struct h3_stream_ctx *stream)
@@ -198,7 +220,90 @@ index ba5339a..552fce8 100644
      Curl_uint32_hash_destroy(&ctx->streams);
      Curl_ssl_peer_cleanup(&ctx->ssl_peer);
      curlx_safefree(ctx->tunnel_inbuf);
-@@ -680,6 +686,7 @@ out:
+@@ -356,7 +362,7 @@ static CURLcode quic_apply_transport_param(ngtcp2_transport_params *t,
+ #define QUIC_TP_GOOGLE_VERSION               UINT64_C(0x4752)
+ #define QUIC_TP_GREASE_ID_BASE              UINT64_C(27)
+ #define QUIC_TP_GREASE_ID_STEP              UINT64_C(31)
+-#define QUIC_TP_GREASE_VALUE_MAXLEN         8
++#define QUIC_TP_GREASE_VALUE_MAXLEN         16
+ #define QUIC_INITIAL_RTT_US_BASE             UINT64_C(333000)
+ #define QUIC_INITIAL_RTT_US_JITTER           UINT64_C(50000)
+ 
+@@ -432,8 +438,9 @@ static CURLcode quic_generate_grease_tp(struct Curl_easy *data,
+   if(result)
+     return result;
+ 
+-  *vlen = (size_t)(lenrnd % QUIC_TP_GREASE_VALUE_MAXLEN) + 1;
+-  return Curl_rand(data, value, *vlen);
++  /* curl-impersonate: 0 to 15 random bytes, as Chromium sends */
++  *vlen = (size_t)(lenrnd % QUIC_TP_GREASE_VALUE_MAXLEN);
++  return *vlen ? Curl_rand(data, value, *vlen) : CURLE_OK;
+ }
+ 
+ static CURLcode quic_permute_token_order(char **tokens, size_t ntokens,
+@@ -605,6 +612,7 @@ static CURLcode quic_parse_version_token(const char *tok,
+ static CURLcode quic_append_version_information(struct dynbuf *raw,
+                                                 uint64_t id,
+                                                 const char *value_str,
++                                                bool shuffle,
+                                                 struct Curl_easy *data)
+ {
+   struct dynbuf vb;
+@@ -615,7 +623,9 @@ static CURLcode quic_append_version_information(struct dynbuf *raw,
+   char *p;
+   char *sep;
+   size_t available_count = 0;
++  uint32_t available[8];
+   uint32_t ver;
++  size_t i;
+ 
+   if(!value_str || !*value_str)
+     return CURLE_BAD_FUNCTION_ARGUMENT;
+@@ -649,10 +659,11 @@ static CURLcode quic_append_version_information(struct dynbuf *raw,
+     result = quic_parse_version_token(p, TRUE, data, &ver);
+     if(result)
+       goto out;
+-    result = quic_dyn_add_u32be(&vb, ver);
+-    if(result)
++    if(available_count >= CURL_ARRAYSIZE(available)) {
++      result = CURLE_BAD_FUNCTION_ARGUMENT;
+       goto out;
+-    ++available_count;
++    }
++    available[available_count++] = ver;
+     if(!comma)
+       break;
+     if(!*(comma + 1)) {
+@@ -667,6 +678,28 @@ static CURLcode quic_append_version_information(struct dynbuf *raw,
+     goto out;
+   }
+ 
++  /* curl-impersonate: with permuted transport parameters, also put the
++   * GREASE version at a random place among the available versions, as
++   * Chromium does. */
++  for(i = available_count - 1; shuffle && i > 0; --i) {
++    unsigned char r;
++    uint32_t swap;
++    size_t j;
++
++    result = Curl_rand(data, &r, sizeof(r));
++    if(result)
++      goto out;
++    j = r % (i + 1);
++    swap = available[i];
++    available[i] = available[j];
++    available[j] = swap;
++  }
++  for(i = 0; i < available_count; ++i) {
++    result = quic_dyn_add_u32be(&vb, available[i]);
++    if(result)
++      goto out;
++  }
++
+   result = quic_raw_append_param_bytes(raw, id,
+                                        (const uint8_t *)curlx_dyn_ptr(&vb),
+                                        curlx_dyn_len(&vb));
+@@ -680,6 +713,7 @@ out:
  static CURLcode quic_transport_params_from_string(ngtcp2_transport_params *t,
                                                    struct dynbuf *raw,
                                                    const ngtcp2_cid *scid,
@@ -206,7 +311,7 @@ index ba5339a..552fce8 100644
                                                    struct Curl_easy *data)
  {
    const char *params = CURL_EASY_STR(data, STRING_QUIC_TRANSPORT_PARAMETERS);
-@@ -787,6 +794,14 @@ static CURLcode quic_transport_params_from_string(ngtcp2_transport_params *t,
+@@ -787,6 +821,14 @@ static CURLcode quic_transport_params_from_string(ngtcp2_transport_params *t,
                (curl_strequal(value_str, "AUTO") ||
                 curl_strequal(value_str, "RANDOM")))
          value_is_initial_rtt_auto = TRUE;
@@ -221,7 +326,17 @@ index ba5339a..552fce8 100644
        else if(id == QUIC_TP_VERSION_INFORMATION || id == QUIC_TP_VERSION_INFORMATION_DRAFT) {
          /* Parsed by dedicated handler below. */
        }
-@@ -915,6 +930,7 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
+@@ -803,7 +845,8 @@ static CURLcode quic_transport_params_from_string(ngtcp2_transport_params *t,
+     }
+ 
+     if(has_value && (id == QUIC_TP_VERSION_INFORMATION || id == QUIC_TP_VERSION_INFORMATION_DRAFT)) {
+-      result = quic_append_version_information(raw, id, value_str, data);
++      result = quic_append_version_information(raw, id, value_str, permute,
++                                               data);
+       if(result)
+         goto out;
+       continue;
+@@ -915,6 +958,7 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
  {
    ngtcp2_settings *s = &ctx->settings;
    ngtcp2_transport_params *t = &ctx->transport_params;
@@ -229,7 +344,7 @@ index ba5339a..552fce8 100644
    CURLcode result;
  
    ngtcp2_settings_default(s);
-@@ -958,9 +974,32 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
+@@ -958,9 +1002,32 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
    if(ctx->qlogfd != -1) {
      s->qlog_write = qlog_callback;
    }
@@ -263,7 +378,7 @@ index ba5339a..552fce8 100644
    return result;
  }
  
-@@ -969,6 +1008,98 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
+@@ -969,6 +1036,98 @@ static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
  #pragma warning(disable:4232) /* MSVC extension, dllimport identity */
  #endif
  
@@ -362,7 +477,7 @@ index ba5339a..552fce8 100644
  static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
  {
    struct Curl_cfilter *cf = user_data;
-@@ -985,6 +1116,7 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
+@@ -985,6 +1144,7 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
    ctx->handshake_at = *Curl_pgrs_now(data);
    ctx->tls_handshake_complete = TRUE;
    Curl_vquic_report_handshake(&ctx->tls, cf, data);
@@ -370,7 +485,7 @@ index ba5339a..552fce8 100644
  
    ctx->tls_vrfy_result = Curl_vquic_tls_verify_peer(&ctx->tls, cf,
                                                      data, &ctx->ssl_peer);
-@@ -1026,6 +1158,8 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
+@@ -1026,6 +1186,8 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
      if(ossl_early_status == SSL_EARLY_DATA_NOT_SENT)
        CURL_TRC_CF(data, cf, "OpenSSL did not send early data");
      ctx->earlydata_accepted = (ossl_early_status == SSL_EARLY_DATA_ACCEPTED);
@@ -379,7 +494,7 @@ index ba5339a..552fce8 100644
  #elif defined(USE_GNUTLS)
      int flags = gnutls_session_get_flags(ctx->tls.gtls.session);
      ctx->earlydata_accepted = !!(flags & GNUTLS_SFLAGS_EARLY_DATA);
-@@ -1042,6 +1176,17 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
+@@ -1042,6 +1204,17 @@ static int cb_ngtcp2_handshake_completed(ngtcp2_conn *tconn, void *user_data)
  #endif /* older NGTCP2 */
      CURL_TRC_CF(data, cf, "server did%s accept %zu bytes of early data",
                  ctx->earlydata_accepted ? "" : " not", ctx->earlydata_skip);
@@ -397,7 +512,7 @@ index ba5339a..552fce8 100644
      Curl_pgrsEarlyData(data, ctx->earlydata_accepted ?
                                (curl_off_t)ctx->earlydata_skip :
                               -(curl_off_t)ctx->earlydata_skip);
-@@ -1337,6 +1482,73 @@ static int cb_recv_rx_key(ngtcp2_conn *tconn, ngtcp2_encryption_level level,
+@@ -1337,6 +1510,73 @@ static int cb_recv_rx_key(ngtcp2_conn *tconn, ngtcp2_encryption_level level,
  #pragma GCC diagnostic push
  #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
  #endif
@@ -471,7 +586,7 @@ index ba5339a..552fce8 100644
  static ngtcp2_callbacks ng_callbacks = {
    ngtcp2_crypto_client_initial_cb,
    NULL, /* recv_client_initial */
-@@ -1366,7 +1578,7 @@ static ngtcp2_callbacks ng_callbacks = {
+@@ -1366,7 +1606,7 @@ static ngtcp2_callbacks ng_callbacks = {
    cb_extend_max_stream_data,
    NULL, /* dcid_status */
    NULL, /* handshake_confirmed */
@@ -480,7 +595,7 @@ index ba5339a..552fce8 100644
    ngtcp2_crypto_delete_crypto_aead_ctx_cb,
    ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
    NULL, /* recv_datagram */
-@@ -1377,7 +1589,7 @@ static ngtcp2_callbacks ng_callbacks = {
+@@ -1377,7 +1617,7 @@ static ngtcp2_callbacks ng_callbacks = {
    NULL, /* version_negotiation */
    cb_recv_rx_key,
    NULL, /* recv_tx_key */
@@ -489,7 +604,7 @@ index ba5339a..552fce8 100644
  #ifdef NGTCP2_CALLBACKS_V2  /* ngtcp2 v1.14.0+ */
    NULL, /* begin_path_validation */
  #endif
-@@ -1432,7 +1644,7 @@ static int quic_ossl_new_session_cb(SSL *ssl, SSL_SESSION *ssl_sessionid)
+@@ -1432,7 +1672,7 @@ static int quic_ossl_new_session_cb(SSL *ssl, SSL_SESSION *ssl_sessionid)
    if(cf && data && ctx) {
      unsigned char *quic_tp = NULL;
      size_t quic_tp_len = 0;
@@ -498,7 +613,7 @@ index ba5339a..552fce8 100644
      ngtcp2_ssize tplen;
      uint8_t tpbuf[256];
  
-@@ -1631,7 +1843,8 @@ static CURLcode cf_ngtcp2_on_session_reuse(struct Curl_cfilter *cf,
+@@ -1631,7 +1871,8 @@ static CURLcode cf_ngtcp2_on_session_reuse(struct Curl_cfilter *cf,
    CURLcode result = CURLE_OK;
  
    *do_early_data = FALSE;
@@ -508,7 +623,7 @@ index ba5339a..552fce8 100644
    ctx->earlydata_max = scs->earlydata_max;
  #endif
  #ifdef USE_GNUTLS
-@@ -1646,7 +1859,8 @@ static CURLcode cf_ngtcp2_on_session_reuse(struct Curl_cfilter *cf,
+@@ -1646,7 +1887,8 @@ static CURLcode cf_ngtcp2_on_session_reuse(struct Curl_cfilter *cf,
  #endif /* WOLFSSL_EARLY_DATA */
  #endif
  #if defined(USE_GNUTLS) || defined(USE_WOLFSSL) || \
@@ -518,7 +633,7 @@ index ba5339a..552fce8 100644
    if(!ctx->earlydata_max) {
      CURL_TRC_CF(data, cf, "SSL session does not allow earlydata");
    }
-@@ -2824,6 +3038,25 @@ CURLcode Curl_cf_ngtcp2_h3_init_ctrls(struct cf_ngtcp2_ctx *ctx,
+@@ -2824,6 +3066,25 @@ CURLcode Curl_cf_ngtcp2_h3_init_ctrls(struct cf_ngtcp2_ctx *ctx,
            ngtcp2_strerror(rc));
      return CURLE_QUIC_CONNECT_ERROR;
    }
@@ -624,7 +739,7 @@ index 67a7f0d..58cbc43 100644
    if(Curl_trc_is_verbose(data)) {
      infof(data, "[HTTP/3] [%" PRId64 "] OPENED stream for %s",
 diff --git a/lib/vtls/openssl.c b/lib/vtls/openssl.c
-index a65c5dd..2655b3a 100644
+index a65c5dd..dee15c3 100644
 --- a/lib/vtls/openssl.c
 +++ b/lib/vtls/openssl.c
 @@ -2979,6 +2979,11 @@ CURLcode Curl_ossl_add_session(struct Curl_cfilter *cf,
@@ -663,6 +778,15 @@ index a65c5dd..2655b3a 100644
  #else
          (void)alpns;
          (void)ssl_config;
+@@ -4473,6 +4495,8 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
+     SSL_CTX_set_grease_enabled(octx->ssl_ctx, 0);
+   else if(data->set.tls_grease)
+     SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
++  if(peer->transport != TRNSPRT_QUIC && data->set.tls_grease_sigalgs)
++    SSL_CTX_set_grease_sigalgs_enabled(octx->ssl_ctx, 1);
+ 
+   if(conn_config->trust_anchors) {
+     CURLcode result = set_trust_anchors(data, octx->ssl_ctx,
 diff --git a/lib/vtls/vtls_scache.c b/lib/vtls/vtls_scache.c
 index f982417..22b78bc 100644
 --- a/lib/vtls/vtls_scache.c

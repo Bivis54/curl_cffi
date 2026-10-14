@@ -367,6 +367,7 @@ class CurlOpt(IntEnum):
     HTTP3_PRIORITY_UPDATE = 0 + 1102
     HTTP3_EARLYDATA = 0 + 1103
     QUIC_ADDRESS_TOKEN = 0 + 1104
+    TLS_GREASE_SIGALGS = 0 + 1105
 
     if locals().get("WRITEDATA"):
         FILE = locals().get("WRITEDATA")

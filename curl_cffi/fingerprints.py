@@ -395,6 +395,7 @@ class Fingerprint:
     tls_delegated_credentials: list[str] = field(default_factory=list)
     tls_record_size_limit: int | None = None
     tls_grease: bool = False
+    tls_grease_sigalgs: bool | None = None
     tls_use_new_alps_codepoint: bool = False
     tls_signed_cert_timestamps: bool = False
     tls_ech: str | None = None
