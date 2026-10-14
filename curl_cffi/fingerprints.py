@@ -422,6 +422,11 @@ class Fingerprint:
     quic_transport_parameters: str = ""
     quic_cid_length: str | None = None
     quic_initial_packet_number: int | None = None
+    quic_max_udp_payload_size: int | None = None
+    quic_address_token: bool | None = None
+    http3_grease_frame: bool | None = None
+    http3_priority_update: bool | None = None
+    http3_earlydata: bool | None = None
 
     ws_headers: dict[str, str] = field(default_factory=dict)
     ws_header_order: str = ""

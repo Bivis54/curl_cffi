@@ -194,6 +194,11 @@ class ExtraFingerprints:
     http3_sig_hash_algs: Optional[str] = None
     http3_tls_extension_order: Optional[str] = None
     quic_initial_packet_number: Optional[int] = None
+    quic_max_udp_payload_size: Optional[int] = None
+    quic_address_token: Optional[bool] = None
+    http3_grease_frame: Optional[bool] = None
+    http3_priority_update: Optional[bool] = None
+    http3_earlydata: Optional[bool] = None
 
 
 class ExtraFpDict(TypedDict, total=False):
@@ -213,6 +218,11 @@ class ExtraFpDict(TypedDict, total=False):
     http3_sig_hash_algs: Optional[str]
     http3_tls_extension_order: Optional[str]
     quic_initial_packet_number: Optional[int]
+    quic_max_udp_payload_size: Optional[int]
+    quic_address_token: Optional[bool]
+    http3_grease_frame: Optional[bool]
+    http3_priority_update: Optional[bool]
+    http3_earlydata: Optional[bool]
 
 
 # TLS version are in the format of 0xAABB, where AA is major version and BB is minor

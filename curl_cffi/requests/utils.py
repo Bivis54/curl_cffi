@@ -364,6 +364,20 @@ def set_extra_fp(curl: Curl, fp: ExtraFingerprints):
         curl.setopt(CurlOpt.HTTP3_TLS_EXTENSION_ORDER, fp.http3_tls_extension_order)
     if fp.quic_initial_packet_number is not None:
         curl.setopt(CurlOpt.QUIC_INITIAL_PACKET_NUMBER, fp.quic_initial_packet_number)
+    _apply_quic_parity(curl, fp)
+
+
+def _apply_quic_parity(curl: Curl, fp: Fingerprint | ExtraFingerprints) -> None:
+    if fp.quic_max_udp_payload_size is not None:
+        curl.setopt(CurlOpt.QUIC_MAX_UDP_PAYLOAD_SIZE, fp.quic_max_udp_payload_size)
+    if fp.quic_address_token is not None:
+        curl.setopt(CurlOpt.QUIC_ADDRESS_TOKEN, int(fp.quic_address_token))
+    if fp.http3_grease_frame is not None:
+        curl.setopt(CurlOpt.HTTP3_GREASE_FRAME, int(fp.http3_grease_frame))
+    if fp.http3_priority_update is not None:
+        curl.setopt(CurlOpt.HTTP3_PRIORITY_UPDATE, int(fp.http3_priority_update))
+    if fp.http3_earlydata is not None:
+        curl.setopt(CurlOpt.HTTP3_EARLYDATA, int(fp.http3_earlydata))
 
 
 def _normalize_tls_version(version: str) -> CurlSslVersion:
@@ -545,6 +559,7 @@ def _apply_fingerprint(
         curl.setopt(
             CurlOpt.QUIC_INITIAL_PACKET_NUMBER, fingerprint.quic_initial_packet_number
         )
+    _apply_quic_parity(curl, fingerprint)
 
     # websocket settings
     if fingerprint.ws_header_order:
