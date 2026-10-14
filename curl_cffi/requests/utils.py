@@ -378,6 +378,8 @@ def _apply_quic_parity(curl: Curl, fp: Fingerprint | ExtraFingerprints) -> None:
         curl.setopt(CurlOpt.HTTP3_PRIORITY_UPDATE, int(fp.http3_priority_update))
     if fp.http3_earlydata is not None:
         curl.setopt(CurlOpt.HTTP3_EARLYDATA, int(fp.http3_earlydata))
+    if fp.tls_grease_sigalgs is not None:
+        curl.setopt(CurlOpt.TLS_GREASE_SIGALGS, int(fp.tls_grease_sigalgs))
 
 
 def _normalize_tls_version(version: str) -> CurlSslVersion:

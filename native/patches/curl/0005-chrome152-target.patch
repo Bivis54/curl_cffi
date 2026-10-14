@@ -1,10 +1,10 @@
-impersonate: chrome152 target (Windows, trust anchor IDs, QUIC parity options)
+impersonate: chrome152 target (Windows, trust anchor IDs, QUIC parity options, signature_algorithms GREASE)
 
 diff --git a/lib/impersonate.c b/lib/impersonate.c
-index aad5688..922d39f 100644
+index aad5688..ef923d1 100644
 --- a/lib/impersonate.c
 +++ b/lib/impersonate.c
-@@ -1043,6 +1043,110 @@ const struct impersonate_opts impersonations[] = {
+@@ -1043,6 +1043,111 @@ const struct impersonate_opts impersonations[] = {
      .split_cookies = true,
      .form_boundary = "webkit",
    },
@@ -99,6 +99,7 @@ index aad5688..922d39f 100644
 +    .tls_use_new_alps_codepoint = true,
 +    .tls_signed_cert_timestamps = true,
 +    .tls_grease = true,
++    .tls_grease_sigalgs = true,
 +    .split_cookies = true,
 +    .form_boundary = "webkit",
 +    /* Trust Anchor IDs (extension 0xca34): Chrome sends this set by

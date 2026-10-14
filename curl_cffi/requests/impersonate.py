@@ -199,6 +199,7 @@ class ExtraFingerprints:
     http3_grease_frame: Optional[bool] = None
     http3_priority_update: Optional[bool] = None
     http3_earlydata: Optional[bool] = None
+    tls_grease_sigalgs: Optional[bool] = None
 
 
 class ExtraFpDict(TypedDict, total=False):
@@ -223,6 +224,7 @@ class ExtraFpDict(TypedDict, total=False):
     http3_grease_frame: Optional[bool]
     http3_priority_update: Optional[bool]
     http3_earlydata: Optional[bool]
+    tls_grease_sigalgs: Optional[bool]
 
 
 # TLS version are in the format of 0xAABB, where AA is major version and BB is minor

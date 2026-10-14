@@ -1,7 +1,7 @@
-conn: crumble Initial CRYPTO data only into the room that is left, like Chrome's chaos protection
+conn: crumble Initial CRYPTO data only into the room that is left, with PING frames like Chrome's chaos protection
 
 diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
-index 7291a16..02700ad 100644
+index 7291a16..4e1124d 100644
 --- a/lib/ngtcp2_conn.c
 +++ b/lib/ngtcp2_conn.c
 @@ -2297,23 +2297,27 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
@@ -17,10 +17,10 @@ index 7291a16..02700ad 100644
  
 -  if (left <= total_crypto_overhead) {
 +  /* curl-impersonate: carry as much CRYPTO data as fits and use only the
-+     room that is left for extra CRYPTO frames, PING and PADDING, as
-+     Chrome's chaos protection does. Crumbling then never costs an extra
-+     Initial packet. A packet followed by more CRYPTO data keeps a little
-+     room for a few extra frames. */
++     room that is left for extra CRYPTO frames and PING frames, as Chrome's
++     chaos protection does. Crumbling then never costs an extra Initial
++     packet. A packet followed by more CRYPTO data keeps a little room for a
++     few extra frames. */
 +  if (left <= single_crypto_overhead * 2) {
      return 0;
    }
@@ -39,7 +39,7 @@ index 7291a16..02700ad 100644
    if (rv != 0) {
      assert(ngtcp2_err_is_fatal(rv));
      return rv;
-@@ -2334,45 +2338,62 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
+@@ -2334,46 +2338,74 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
      offsets[i] = offsets[i - 1] + data[i - 1].len;
    }
  
@@ -98,8 +98,8 @@ index 7291a16..02700ad 100644
 +    --max_add;
    }
  
-+  /* Half of the room goes to extra CRYPTO frames, the rest to PING and
-+     PADDING. */
++  /* Half of the room goes to extra CRYPTO frames, some of the rest to
++     PING frames. */
 +  max_add /= 2;
    if (datacnt < max_add_frames + 1) {
      max_add_frames -= datacnt - 1;
@@ -109,22 +109,38 @@ index 7291a16..02700ad 100644
  
      datacnt = ngtcp2_pkt_split_vec_rand(data, datacnt, offsets, &conn->pcg,
 -                                        max_add_frames);
-+                                        max_add);
-   }
- 
+-  }
+-
 -  for (i = 1; i < datacnt; ++i) {
 -    total_crypto_overhead -= 1 + ngtcp2_put_uvarintlen(offsets[i]) +
 -                             ngtcp2_put_uvarintlen(data[i].len);
++                                        max_add);
++  }
++
 +  used = datalen;
 +  for (i = 0; i < datacnt; ++i) {
 +    used += 1 + ngtcp2_put_uvarintlen(offsets[i]) +
 +            ngtcp2_put_uvarintlen(data[i].len);
-   }
++  }
 +  assert(used <= left);
++
++  /* Only PING frames: what is still left over is padded at the end of the
++     packet, or carries coalesced 0-RTT packets, as with Chrome. */
++  max_add = ngtcp2_min_size(left - used, max_add_frames);
++  max_add = ngtcp2_min_size(max_add, NGTCP2_MAX_STREAM_DATACNT - datacnt);
++  if (max_add) {
++    max_add = ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)max_add) + 1;
++    for (i = 0; i < max_add; ++i) {
++      data[datacnt++] = (ngtcp2_vec){
++        .base = NULL,
++        .len = 0,
++      };
++    }
+   }
  
-   datacnt = ngtcp2_pkt_append_ping_and_padding(data, datacnt, &conn->pcg,
+-  datacnt = ngtcp2_pkt_append_ping_and_padding(data, datacnt, &conn->pcg,
 -                                               total_crypto_overhead);
-+                                               left - used);
- 
+-
    ngtcp2_pkt_permutate_vec(data, datacnt, offsets, &conn->pcg);
  
+   return (ngtcp2_ssize)datacnt;
