@@ -21,14 +21,17 @@ from playwright.sync_api import sync_playwright
 BROWSERLEAKS = "https://quic.browserleaks.com/?minify=1"
 IMPERSONATE_H3 = "https://fp.impersonate.pro/api/http3"
 PEET = "https://tls.peet.ws/api/all"
+BROWSERLEAKS_TLS = "https://tls.browserleaks.com/json"
 
 
 def load_json(page, url: str, protocols: dict[str, str]) -> tuple[dict | None, str]:
-    response = page.goto(url, wait_until="load", timeout=60_000)
-    text = page.inner_text("body")
+    try:
+        page.goto(url, wait_until="load", timeout=45_000)
+        text = page.inner_text("body")
+    except Exception as e:  # noqa: BLE001
+        print(f"{url}: {e!r}"[:300])
+        return None, "error"
     protocol = protocols.get(url, "")
-    if response is None:
-        return None, protocol
     try:
         return json.loads(text), protocol
     except json.JSONDecodeError:
@@ -68,6 +71,8 @@ def main() -> None:
 
         tcp, proto = load_json(page, PEET, protocols)
         result["peet"] = {"protocol": proto, "data": tcp}
+        tcp, proto = load_json(page, BROWSERLEAKS_TLS, protocols)
+        result["browserleaks_tls"] = {"protocol": proto, "data": tcp}
 
         first = None
         attempts = []
