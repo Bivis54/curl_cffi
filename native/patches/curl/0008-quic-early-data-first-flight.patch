@@ -1,0 +1,18 @@
+quic: send the first flight before the request with early data
+
+diff --git a/lib/vquic/cf-ngtcp2-cmn.c b/lib/vquic/cf-ngtcp2-cmn.c
+index a23d15b..d90bbd5 100644
+--- a/lib/vquic/cf-ngtcp2-cmn.c
++++ b/lib/vquic/cf-ngtcp2-cmn.c
+@@ -2156,7 +2156,11 @@ CURLcode Curl_cf_ngtcp2_cmn_connect(struct Curl_cfilter *cf,
+     if(result)
+       goto out;
+     if(cf->connected) {
++      /* curl-impersonate: with early data, send the first flight and the
++       * HTTP/3 control streams before a request is added, like Chrome.
++       * Servers then get SETTINGS and GREASE in a packet of their own. */
+       *done = TRUE;
++      result = Curl_cf_ngtcp2_progress_egress(cf, data, &pktx);
+       goto out;
+     }
+     result = Curl_cf_ngtcp2_progress_egress(cf, data, &pktx);
