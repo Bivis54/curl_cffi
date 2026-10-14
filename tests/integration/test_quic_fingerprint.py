@@ -18,18 +18,30 @@ from pathlib import Path
 import pytest
 
 TESTS = Path(__file__).resolve().parents[1]
-REFERENCES = ["chrome155.json", "chrome152.json"]
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("RUN_LIVE_TESTS"), reason="set RUN_LIVE_TESTS=1"
 )
 
 
-def comparator_failures(reference: str, snapshot: dict) -> list[str]:
+def references(snapshot: dict) -> list[str]:
+    """Like Chrome, curl uses real ECH when DNS has HTTPS records for the site
+    (direct connections) and GREASE ECH behind a proxy."""
+    first = snapshot["browserleaks_first"].get("data") or {}
+    if ((first.get("tls") or {}).get("ech") or {}).get("ech_success"):
+        return ["chrome154_dns_ech.json"]
+    return ["chrome155.json", "chrome152.json"]
+
+
+def comparator_failures(snapshot: dict, tcp: bool) -> dict[str, list[str]]:
     from fingerprint_diff import diff
 
-    ref = json.loads((TESTS / "groundtruth" / reference).read_text())
-    return diff(ref, snapshot).failed
+    failures = {}
+    for reference in references(snapshot):
+        ref = json.loads((TESTS / "groundtruth" / reference).read_text())
+        failed = diff(ref, snapshot).failed
+        failures[reference] = [n for n in failed if n.startswith("tcp.") == tcp]
+    return failures
 
 
 @pytest.fixture(scope="module")
@@ -45,18 +57,16 @@ def snapshot() -> dict:
     return snap
 
 
-@pytest.mark.parametrize("reference", REFERENCES)
-def test_quic_matches_chrome(snapshot, reference):
-    failed = comparator_failures(reference, snapshot)
-    assert [name for name in failed if not name.startswith("tcp.")] == []
+def test_quic_matches_chrome(snapshot):
+    failures = comparator_failures(snapshot, tcp=False)
+    assert failures == dict.fromkeys(failures, [])
 
 
-@pytest.mark.parametrize("reference", REFERENCES)
-def test_tcp_matches_chrome(snapshot, reference):
+def test_tcp_matches_chrome(snapshot):
     if not snapshot["peet"].get("data"):
         pytest.skip(f"tls.peet.ws unavailable: {snapshot['peet']}")
-    failed = comparator_failures(reference, snapshot)
-    assert [name for name in failed if name.startswith("tcp.")] == []
+    failures = comparator_failures(snapshot, tcp=True)
+    assert failures == dict.fromkeys(failures, [])
 
 
 def test_google_http3_certificate_verifies():
