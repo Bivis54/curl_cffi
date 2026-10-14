@@ -169,6 +169,14 @@ Levers (`native/patches/`):
   resumption (GET/HEAD only), 0-RTT transport parameters, `NEW_TOKEN` tokens
   kept per peer in the session cache and replayed. A server rejecting 0-RTT
   makes curl re-send the request after the handshake (tested).
+- **0-RTT packet layout** (`0008`): with early data curl wrote nothing until
+  the request was added, so whenever the ClientHello filled the second Initial
+  datagram, SETTINGS, GREASE, PRIORITY_UPDATE and HEADERS shared one 0-RTT
+  packet. quic.browserleaks.com reads the streams concurrently and reported
+  only SETTINGS and HEADERS for 2 of 20 resumed connections (`h3_hash`
+  mismatch). Chrome sends the control stream in its first flight and the
+  request in a later packet (seen in a decrypted local capture); curl now does
+  the same, and 40 of 40 resumed connections were correct afterwards.
 - **Transport parameter details**: GREASE TP with 0-15 random bytes and a
   random GREASE position in `version_information`, both like Chromium.
 - **TCP**: `CURLOPT_TLS_GREASE_SIGALGS` (BoringSSL
@@ -185,7 +193,11 @@ Levers (`native/patches/`):
 Structural comparator (`tests/quic_bench/fingerprint_diff.py`) against
 `tests/groundtruth/chrome155.json` (the same with `chrome152.json`): **0
 failed checks** for this branch, **23** for chrome152-2, **25** for upstream
-0.16.4b1.
+0.16.4b1. Like Chrome, curl uses real ECH when DNS has HTTPS records for the
+site, which is the case on direct connections; behind a proxy neither has
+them and both use GREASE ECH. CI therefore compares a direct capture with
+`chrome154_dns_ech.json` and a capture through a local SOCKS5 proxy with the
+Chrome 155 and 152 captures; both show 0 failed checks.
 
 ### Chrome details found while measuring
 
@@ -224,6 +236,14 @@ failed checks** for this branch, **23** for chrome152-2, **25** for upstream
   attempts the relay returns a single datagram from Google. Other QUIC sites work
   through the same relays, and Google works from CI with direct UDP
   (`test_google_http3_certificate_verifies`).
+- **QPACK differs from Chrome, visible to the server only** (decrypted local
+  captures). Chrome opens its QPACK encoder stream with the first request,
+  inserts most headers into the dynamic table (about 400 bytes of encoder
+  instructions, a 20-byte HEADERS frame) and uses remembered server SETTINGS
+  for 0-RTT. nghttp3 opens the control, encoder and decoder streams together,
+  sends a 190-byte HEADERS frame on new connections and only literal headers
+  (430 bytes) in 0-RTT. quic.browserleaks.com and fp.impersonate.pro do not
+  report this; matching it needs a different encoder strategy in nghttp3.
 - `Curl.getinfo(CurlInfo.CERTINFO)` crashes: curl_cffi treats the
   `struct curl_certinfo *` result as a `curl_slist` and frees curl's memory.
   This is upstream curl_cffi code, unchanged here.
@@ -239,6 +259,7 @@ failed checks** for this branch, **23** for chrome152-2, **25** for upstream
   the proxy, IPv4 preference, and real proxies from `SOCKS5_UDP_PROXIES`.
 - `tests/integration/test_websocket_idle.py` (`RUN_SLOW_TESTS=1`),
   `test_close_wait.py`, `test_websocket_transport.py`,
+  `test_http3_early_data.py` (0-RTT request after the control streams),
   `tests/unittest/test_websockets_fork.py`.
 - `tests/integration/test_quic_fingerprint.py` (`RUN_LIVE_TESTS=1`, optional
   `FINGERPRINT_PROXY`): live capture diffed against the Chrome references,
