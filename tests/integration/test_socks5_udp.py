@@ -152,6 +152,46 @@ def test_resumption_and_0rtt_through_proxy(request, socks_proxy, server):
     assert_single_destination(proxy.settle(2))
 
 
+def dual_stack(port: int) -> list[str]:
+    # IPv6 first like a dual-stack name; the local servers only listen on IPv4,
+    # like a proxy without IPv6 egress.
+    return [f"localhost:{port}:[::1],127.0.0.1"]
+
+
+def test_socks5_prefers_ipv4_destination_for_quic(h3_server, socks_proxy):
+    proxy = socks_proxy("--single-target")
+    r = requests.get(
+        h3_server.url,
+        impersonate="chrome",
+        http_version="v3only",
+        proxy=proxy.url("socks5"),
+        verify=False,
+        timeout=15,
+        curl_options={CurlOpt.RESOLVE: dual_stack(h3_server.port)},
+    )
+    assert r.http_version == 30
+    assert proxy.settle(1)[0]["dst"] == [f"127.0.0.1:{h3_server.port}"]
+
+
+async def echo(ws) -> None:
+    async for message in ws:
+        await ws.send(message)
+
+
+def test_socks5_prefers_ipv4_destination_for_tcp(wss_server, socks_proxy):
+    port = int(wss_server(echo).rsplit(":", 1)[1])
+    proxy = socks_proxy()
+    with requests.Session(curl_options={CurlOpt.RESOLVE: dual_stack(port)}) as s:
+        ws = s.ws_connect(
+            f"wss://localhost:{port}", proxy=proxy.url("socks5"), verify=False
+        )
+        ws.send(b"ipv4")
+        assert ws.recv()[0] == b"ipv4"
+        ws.close()
+    connects = [r for r in proxy.records() if r.get("cmd") == "CONNECT"]
+    assert [(r["host"], r["port"]) for r in connects] == [("127.0.0.1", port)]
+
+
 REAL_PROXIES = [p for p in os.environ.get("SOCKS5_UDP_PROXIES", "").split(",") if p]
 BROWSERLEAKS = "https://quic.browserleaks.com/?minify=1"
 IMPERSONATE_H3 = "https://fp.impersonate.pro/api/http3"
