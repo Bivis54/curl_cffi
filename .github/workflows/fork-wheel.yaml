@@ -76,6 +76,9 @@ jobs:
     name: Verify on Ubuntu 24.04
     needs: wheel
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
     steps:
     - uses: actions/checkout@v4
 
@@ -91,20 +94,62 @@ jobs:
     - name: Install wheel
       run: |
         python -m venv /tmp/venv
-        /tmp/venv/bin/pip install wheelhouse/*.whl pytest pytest-asyncio websockets trustme aioquic
+        /tmp/venv/bin/pip install "$(ls wheelhouse/*.whl)[test]" aioquic
+        # Tests run from a copy so that the source tree cannot shadow the wheel.
+        mkdir -p /tmp/ci results
+        cp -r tests assets /tmp/ci/
         cd /tmp && /tmp/venv/bin/python -c "import curl_cffi; print(curl_cffi.__version__, curl_cffi.__curl_version__)"
 
-    - name: Fingerprint snapshot
+    - name: Unit tests
+      working-directory: /tmp/ci/tests
       run: |
-        cd /tmp
-        /tmp/venv/bin/python "$GITHUB_WORKSPACE/tests/quic_bench/capture_curl_cffi.py" \
+        /tmp/venv/bin/python -bb -m pytest unittest -p no:cacheprovider -o asyncio_mode=auto -q \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/unittest.log"
+
+    - name: Integration tests (SOCKS5 UDP relays, idle wss, CLOSE_WAIT, WebSocket on TCP)
+      working-directory: /tmp/ci/tests
+      env:
+        RUN_SLOW_TESTS: "1"
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -o asyncio_mode=auto -rA -s \
+          integration/test_socks5_udp.py integration/test_close_wait.py \
+          integration/test_websocket_transport.py integration/test_websocket_idle.py \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/integration.log"
+
+    - name: Fingerprint snapshot
+      working-directory: /tmp
+      run: |
+        /tmp/venv/bin/python /tmp/ci/tests/quic_bench/capture_curl_cffi.py \
           --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel
+
+    - name: Compare with Chrome
+      working-directory: /tmp/ci/tests
+      run: |
+        status=0
+        for ref in chrome155 chrome152; do
+          /tmp/venv/bin/python quic_bench/fingerprint_diff.py "groundtruth/$ref.json" \
+            "$GITHUB_WORKSPACE/snapshots/fork-wheel.json" \
+            | tee "$GITHUB_WORKSPACE/results/diff-$ref.txt" || status=1
+        done
+        exit $status
+
+    - name: Real SOCKS5 UDP proxies
+      # The maintainer's public test proxies are not always up.
+      continue-on-error: true
+      working-directory: /tmp/ci/tests
+      env:
+        SOCKS5_UDP_PROXIES: socks5h://imp:curl-cffi@206.189.95.199:1080,socks5h://imp:curl-cffi@24.144.88.46:1080
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -rA integration/test_socks5_udp.py -k real_proxy \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/real-proxies.log"
 
     - uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: snapshot-fork-wheel
-        path: snapshots/
+        name: bench-results
+        path: |
+          snapshots/
+          results/
 
   release:
     name: Publish pre-release
