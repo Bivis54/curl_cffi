@@ -115,23 +115,36 @@ jobs:
         /tmp/venv/bin/python -m pytest -p no:cacheprovider -o asyncio_mode=auto -rA -s \
           integration/test_socks5_udp.py integration/test_close_wait.py \
           integration/test_websocket_transport.py integration/test_websocket_idle.py \
+          integration/test_http3_early_data.py \
           2>&1 | tee "$GITHUB_WORKSPACE/results/integration.log"
 
-    - name: Fingerprint snapshot
+    - name: Fingerprint snapshots (direct and through a local SOCKS5 proxy)
       working-directory: /tmp
       run: |
-        /tmp/venv/bin/python /tmp/ci/tests/quic_bench/capture_curl_cffi.py \
-          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel
+        bench=/tmp/ci/tests/quic_bench
+        /tmp/venv/bin/python $bench/capture_curl_cffi.py \
+          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-direct
+        /tmp/venv/bin/python $bench/socks5_udp.py 1080 "$GITHUB_WORKSPACE/results/socks5-proxy.log" &
+        sleep 2
+        /tmp/venv/bin/python $bench/capture_curl_cffi.py \
+          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-socks5 \
+          --proxy socks5h://user:pass@127.0.0.1:1080
+        kill %1
 
     - name: Compare with Chrome
       working-directory: /tmp/ci/tests
       run: |
         status=0
-        for ref in chrome155 chrome152; do
-          /tmp/venv/bin/python quic_bench/fingerprint_diff.py "groundtruth/$ref.json" \
-            "$GITHUB_WORKSPACE/snapshots/fork-wheel.json" \
-            | tee "$GITHUB_WORKSPACE/results/diff-$ref.txt" || status=1
-        done
+        compare() {
+          /tmp/venv/bin/python quic_bench/fingerprint_diff.py "groundtruth/$1.json" \
+            "$GITHUB_WORKSPACE/snapshots/$2.json" \
+            | tee "$GITHUB_WORKSPACE/results/diff-$2-$1.txt" || status=1
+        }
+        # Direct connections get ECH configs from DNS, like Chrome; behind a
+        # proxy neither has them and both use GREASE ECH.
+        compare chrome154_dns_ech fork-wheel-direct
+        compare chrome155 fork-wheel-socks5
+        compare chrome152 fork-wheel-socks5
         exit $status
 
     - name: Google over HTTP/3 with trust anchor IDs
