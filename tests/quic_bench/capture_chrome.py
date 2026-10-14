@@ -80,20 +80,22 @@ def main() -> None:
         tcp, proto = load_json(page, BROWSERLEAKS_TLS, protocols)
         result["browserleaks_tls"] = {"protocol": proto, "data": tcp}
 
-        first = None
-        attempts = []
-        for _ in range(8):
-            data, proto = load_json(page, BROWSERLEAKS, protocols)
-            attempts.append(proto)
-            if data and proto == "h3":
-                first = data
-                break
-            time.sleep(1)
+        def first_quic(url: str) -> tuple[dict | None, list[str]]:
+            attempts = []
+            for _ in range(8):
+                data, proto = load_json(page, url, protocols)
+                attempts.append(proto)
+                if data and proto == "h3":
+                    return data, attempts
+                time.sleep(1)
+            return None, attempts
+
+        first, attempts = first_quic(BROWSERLEAKS)
         result["browserleaks_attempts"] = attempts
         result["browserleaks_first"] = first
 
-        h3, proto = load_json(page, IMPERSONATE_H3, protocols)
-        result["impersonate_h3"] = {"protocol": proto, "data": h3}
+        h3, h3_attempts = first_quic(IMPERSONATE_H3)
+        result["impersonate_h3"] = {"protocol": h3_attempts[-1], "data": h3}
 
         # Let both QUIC connections hit the idle timeout so the next load
         # resumes instead of reusing the open connection.

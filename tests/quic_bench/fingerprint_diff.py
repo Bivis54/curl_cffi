@@ -20,6 +20,7 @@ from pathlib import Path
 FIXED_TP = {1, 3, 4, 5, 6, 7, 8, 9, 32}
 TP_INITIAL_RTT = 12583
 EXT_PSK = 41
+EXT_EARLY_DATA = 42
 GREASE_ECH_PAYLOADS = {144, 176, 208, 240}
 
 
@@ -183,6 +184,25 @@ def compare_quic(r: Report, label: str, ref: dict, cand: dict) -> None:
     r.check(p + "http3.priority_update", rpu == cpu, rpu, cpu)
 
 
+def compare_impersonate_pro(r: Report, label: str, ref: dict, cand: dict) -> None:
+    """fp.impersonate.pro/api/http3, the curl_cffi maintainer's own check."""
+    p = f"{label}."
+    rq, cq = ref.get("quic") or {}, cand.get("quic") or {}
+    r.check(p + "quic", rq == cq, rq, cq)
+    rt, ct = ref.get("tls") or {}, cand.get("tls") or {}
+    rj = (rt.get("ja3n") or {}).get("text")
+    cj = (ct.get("ja3n") or {}).get("text")
+    r.check(p + "ja3n", rj == cj, rj, cj)
+    rs = sorted(map(str, (norm_ext(e["id"]) for e in rt.get("extensions") or [])))
+    cs = sorted(map(str, (norm_ext(e["id"]) for e in ct.get("extensions") or [])))
+    r.check(p + "tls.extension_set", rs == cs, rs, cs)
+    rh, ch = ref.get("http3") or {}, cand.get("http3") or {}
+    rp, cp = rh.get("perk_text_normalized"), ch.get("perk_text_normalized")
+    r.check(p + "perk_text_normalized", rp == cp, rp, cp)
+    ro, co = rh.get("header_order"), ch.get("header_order")
+    r.check(p + "http3.header_order", ro == co, ro, co)
+
+
 def compare_tcp(r: Report, ref: dict, cand: dict) -> None:
     rt, ct = ref.get("tls") or {}, cand.get("tls") or {}
     r.check("tcp.ja4", rt.get("ja4") == ct.get("ja4"), rt.get("ja4"), ct.get("ja4"))
@@ -195,6 +215,46 @@ def compare_tcp(r: Report, ref: dict, cand: dict) -> None:
         rt.get("peetprint_hash"),
         ct.get("peetprint_hash"),
     )
+
+
+def diff(ref: dict, cand: dict, optional: set[str] | None = None) -> Report:
+    r = Report(optional or set())
+    print(f"reference: {ref.get('label')} {ref.get('browser_version', '')}")
+    print(f"candidate: {cand.get('label')} {cand.get('libcurl', '')}")
+    for key in ("browserleaks_first", "browserleaks_resumed"):
+        rd, cd = entry_data(ref, key), entry_data(cand, key)
+        if not rd or not cd:
+            r.check(key, False, bool(rd), bool(cd))
+            continue
+        compare_quic(r, key, rd, cd)
+    for key in ("impersonate_h3", "impersonate_h3_resumed"):
+        rd, cd = entry_data(ref, key), entry_data(cand, key)
+        if rd.get("quic") and cd.get("quic"):
+            compare_impersonate_pro(r, key, rd, cd)
+        else:
+            print(f"SKIP  {key} (no HTTP/3 snapshot)")
+    first, resumed = (
+        entry_data(cand, "browserleaks_first"),
+        entry_data(cand, "browserleaks_resumed"),
+    )
+    if first and resumed:
+        shared = [norm_ext(e) for e in ext_ids(first)]
+        again = [
+            norm_ext(e) for e in ext_ids(resumed) if e not in (EXT_PSK, EXT_EARLY_DATA)
+        ]
+        r.check(
+            "tls.order_differs_between_connections",
+            shared != again,
+            "different",
+            [shared, again],
+        )
+    rp, cp = entry_data(ref, "peet"), entry_data(cand, "peet")
+    if rp and cp:
+        compare_tcp(r, rp, cp)
+    else:
+        print("SKIP  tcp (no tls.peet.ws snapshot)")
+    print(f"\n{len(r.failed)} failed check(s)" + (f": {r.failed}" if r.failed else ""))
+    return r
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,31 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     ref = json.loads(Path(args.reference).read_text())
     cand = json.loads(Path(args.candidate).read_text())
-    r = Report(set(args.optional))
-    print(f"reference: {ref.get('label')} {ref.get('browser_version', '')}")
-    print(f"candidate: {cand.get('label')} {cand.get('libcurl', '')}")
-    for key in ("browserleaks_first", "browserleaks_resumed"):
-        rd, cd = entry_data(ref, key), entry_data(cand, key)
-        if not rd or not cd:
-            r.check(key, False, bool(rd), bool(cd))
-            continue
-        compare_quic(r, key, rd, cd)
-    first, resumed = (
-        entry_data(cand, "browserleaks_first"),
-        entry_data(cand, "browserleaks_resumed"),
-    )
-    if first and resumed:
-        r.check(
-            "tls.order_differs_between_connections",
-            ext_ids(first) != ext_ids(resumed)[: len(ext_ids(first))],
-            "different",
-            [ext_ids(first), ext_ids(resumed)],
-        )
-    rp, cp = entry_data(ref, "peet"), entry_data(cand, "peet")
-    if rp and cp:
-        compare_tcp(r, rp, cp)
-    print(f"\n{len(r.failed)} failed check(s)" + (f": {r.failed}" if r.failed else ""))
-    return 1 if r.failed else 0
+    return 1 if diff(ref, cand, set(args.optional)).failed else 0
 
 
 if __name__ == "__main__":

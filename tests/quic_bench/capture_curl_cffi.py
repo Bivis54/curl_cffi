@@ -49,6 +49,32 @@ def fetch_pair(url: str, http_version: str, **kwargs) -> tuple[dict, dict]:
     return first, resumed
 
 
+def capture(
+    label: str = "curl_cffi",
+    impersonate: str = "chrome",
+    proxy: str | None = None,
+    http_version: str = "v3only",
+) -> dict[str, object]:
+    kwargs = {"impersonate": impersonate}
+    if proxy:
+        kwargs["proxy"] = proxy
+    result: dict[str, object] = {
+        "label": label,
+        "curl_cffi": curl_cffi.__version__,
+        "libcurl": curl_cffi.__curl_version__,
+    }
+    with requests.Session() as s:
+        result["peet"] = fetch(s, PEET, None, **kwargs)
+        result["browserleaks_tls"] = fetch(s, BROWSERLEAKS_TLS, None, **kwargs)
+    result["browserleaks_first"], result["browserleaks_resumed"] = fetch_pair(
+        BROWSERLEAKS, http_version, **kwargs
+    )
+    result["impersonate_h3"], result["impersonate_h3_resumed"] = fetch_pair(
+        IMPERSONATE_H3, http_version, **kwargs
+    )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
@@ -60,23 +86,7 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    kwargs = {"impersonate": args.impersonate}
-    if args.proxy:
-        kwargs["proxy"] = args.proxy
-    result: dict[str, object] = {
-        "label": args.label,
-        "curl_cffi": curl_cffi.__version__,
-        "libcurl": curl_cffi.__curl_version__,
-    }
-    with requests.Session() as s:
-        result["peet"] = fetch(s, PEET, None, **kwargs)
-        result["browserleaks_tls"] = fetch(s, BROWSERLEAKS_TLS, None, **kwargs)
-    result["browserleaks_first"], result["browserleaks_resumed"] = fetch_pair(
-        BROWSERLEAKS, args.http_version, **kwargs
-    )
-    result["impersonate_h3"], result["impersonate_h3_resumed"] = fetch_pair(
-        IMPERSONATE_H3, args.http_version, **kwargs
-    )
+    result = capture(args.label, args.impersonate, args.proxy, args.http_version)
 
     path = out / f"{args.label}.json"
     path.write_text(json.dumps(result, indent=2, sort_keys=True))
