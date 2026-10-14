@@ -7,6 +7,11 @@ connection. Chrome then closes the idle connection after its 30 s idle timeout
 and the next load resumes the session (PSK, early data, address token).
 
 usage: capture_chrome.py --chrome /path/to/chrome --out DIR [--label NAME]
+                         [--chrome-arg ARG ...]
+
+Pass --chrome-arg=--host-resolver-rules=... to keep Chrome from fetching the
+origin's HTTPS DNS record, like a browser behind a proxy: it then sends a
+GREASE ECH extension instead of real ECH.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--label", default="chrome")
     parser.add_argument("--idle", type=float, default=45.0)
+    parser.add_argument("--chrome-arg", action="append", default=[])
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -54,7 +60,7 @@ def main() -> None:
         browser = p.chromium.launch(
             executable_path=args.chrome,
             headless=True,
-            args=["--no-first-run", "--no-default-browser-check"],
+            args=["--no-first-run", "--no-default-browser-check", *args.chrome_arg],
         )
         result["browser_version"] = browser.version
         context = browser.new_context()

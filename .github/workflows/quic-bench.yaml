@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        chrome: [cft-154, cft-152, preinstalled]
+        chrome: [cft-154, cft-154-noech, cft-152, preinstalled]
     steps:
     - uses: actions/checkout@v4
 
@@ -36,6 +36,7 @@ jobs:
         fi
         milestone="${{ matrix.chrome }}"
         milestone="${milestone#cft-}"
+        milestone="${milestone%-noech}"
         url=$(curl -sSL https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone-with-downloads.json \
           | python -c "import json,sys; d=json.load(sys.stdin)['milestones']['$milestone']; print([x['url'] for x in d['downloads']['chrome'] if x['platform']=='linux64'][0])")
         echo "Downloading $url"
@@ -47,8 +48,14 @@ jobs:
       run: |
         pip install playwright
         python -m playwright install-deps chromium > /dev/null
+        extra=()
+        if [[ "${{ matrix.chrome }}" == *-noech ]]; then
+          rules="MAP quic.browserleaks.com $(getent ahostsv4 quic.browserleaks.com | head -1 | cut -d' ' -f1)"
+          rules="$rules, MAP fp.impersonate.pro $(getent ahostsv4 fp.impersonate.pro | head -1 | cut -d' ' -f1)"
+          extra=(--chrome-arg="--host-resolver-rules=$rules")
+        fi
         python tests/quic_bench/capture_chrome.py --chrome "${{ steps.chrome.outputs.path }}" \
-          --out snapshots --label "chrome-${{ matrix.chrome }}"
+          --out snapshots --label "chrome-${{ matrix.chrome }}" "${extra[@]}"
 
     - uses: actions/upload-artifact@v4
       with:
