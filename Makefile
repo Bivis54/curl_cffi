@@ -28,6 +28,7 @@ curl-impersonate-$(VERSION)/patches: $(CURL_VERSION)
 	cd $(CURL_VERSION)
 	# for p in $</curl*.patch; do patch -p1 < ../$$p; done
 	patch -p1 < ../$</curl.patch
+	for p in ../native/patches/curl/*.patch; do patch -p1 < $$p; done
 	# Re-generate the configure script
 	autoreconf -fi
 	mkdir -p ../include/curl

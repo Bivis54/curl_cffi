@@ -1,0 +1,130 @@
+conn: crumble Initial CRYPTO data only into the room that is left, like Chrome's chaos protection
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 7291a16..02700ad 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -2297,23 +2297,27 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
+   size_t single_crypto_overhead =
+     1 + ngtcp2_put_uvarintlen(crypto_offset + left - 1) +
+     ngtcp2_put_uvarintlen(left);
+-  size_t total_crypto_overhead = single_crypto_overhead * max_add_frames;
++  size_t datalen, used, budget, max_add;
+   size_t datacnt;
+   size_t i;
++  int more;
+   int rv;
+ 
+-  if (left <= total_crypto_overhead) {
++  /* curl-impersonate: carry as much CRYPTO data as fits and use only the
++     room that is left for extra CRYPTO frames, PING and PADDING, as
++     Chrome's chaos protection does. Crumbling then never costs an extra
++     Initial packet. A packet followed by more CRYPTO data keeps a little
++     room for a few extra frames. */
++  if (left <= single_crypto_overhead * 2) {
+     return 0;
+   }
+ 
+-  left -= total_crypto_overhead;
+-
+-  left = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
+-  if (left == (size_t)-1) {
++  datalen = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
++  if (datalen == (size_t)-1) {
+     return 0;
+   }
+ 
+-  rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc, left);
++  rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc, datalen);
+   if (rv != 0) {
+     assert(ngtcp2_err_is_fatal(rv));
+     return rv;
+@@ -2334,45 +2338,62 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
+     offsets[i] = offsets[i - 1] + data[i - 1].len;
+   }
+ 
+-  if (datacnt < NGTCP2_MAX_STREAM_DATACNT &&
+-      ngtcp2_pkt_find_server_name(&server_name, data) && server_name.len > 1) {
+-    if (ngtcp2_strm_streamfrq_empty(crypto_strm) ||
+-        ngtcp2_strm_streamfrq_unacked_offset(crypto_strm) == (uint64_t)-1) {
+-      datacnt = ngtcp2_pkt_split_vec_at(
+-        data, datacnt, offsets,
+-        (size_t)(server_name.base - data[0].base) + server_name.len / 2);
+-    } else {
+-      /* If we have another data to send (most likely in the another
+-         packet), remove the part of SNI from this packet. */
+-      datacnt = ngtcp2_pkt_remove_vec_partial(
+-        &removed_data, data, datacnt, offsets, &conn->pcg, &server_name);
++  more = !ngtcp2_strm_streamfrq_empty(crypto_strm) &&
++         ngtcp2_strm_streamfrq_unacked_offset(crypto_strm) != (uint64_t)-1;
++  if (more && datacnt == 1 && data[0].len > single_crypto_overhead * 5) {
++    removed_data = (ngtcp2_vec){
++      .base = data[0].base + data[0].len - single_crypto_overhead * 4,
++      .len = single_crypto_overhead * 4,
++    };
+ 
+-      rv = conn_cut_crypto_frame(conn, *pfrc, crypto_strm, &removed_data);
+-      if (rv != 0) {
+-        ngtcp2_frame_chain_objalloc_del(*pfrc, &conn->frc_objalloc, conn->mem);
+-        return rv;
+-      }
+-
+-      /* Add the length of removed data to total_crypto_overhead so
+-         that we can use them for inter CRYPTO frames padding. */
+-      total_crypto_overhead += removed_data.len;
++    rv = conn_cut_crypto_frame(conn, *pfrc, crypto_strm, &removed_data);
++    if (rv != 0) {
++      ngtcp2_frame_chain_objalloc_del(*pfrc, &conn->frc_objalloc, conn->mem);
++      return rv;
+     }
++
++    data[0].len -= removed_data.len;
++  }
++
++  datalen = (size_t)ngtcp2_vec_len(data, datacnt);
++  used = datalen;
++  for (i = 0; i < datacnt; ++i) {
++    used += 1 + ngtcp2_put_uvarintlen(offsets[i]) +
++            ngtcp2_put_uvarintlen(data[i].len);
++  }
++  budget = left > used ? left - used : 0;
++  max_add = budget / single_crypto_overhead;
++
++  if (max_add && datacnt < NGTCP2_MAX_STREAM_DATACNT &&
++      ngtcp2_pkt_find_server_name(&server_name, data) && server_name.len > 1) {
++    datacnt = ngtcp2_pkt_split_vec_at(
++      data, datacnt, offsets,
++      (size_t)(server_name.base - data[0].base) + server_name.len / 2);
++    --max_add;
+   }
+ 
++  /* Half of the room goes to extra CRYPTO frames, the rest to PING and
++     PADDING. */
++  max_add /= 2;
+   if (datacnt < max_add_frames + 1) {
+     max_add_frames -= datacnt - 1;
++    if (max_add > max_add_frames) {
++      max_add = max_add_frames;
++    }
+ 
+     datacnt = ngtcp2_pkt_split_vec_rand(data, datacnt, offsets, &conn->pcg,
+-                                        max_add_frames);
++                                        max_add);
+   }
+ 
+-  for (i = 1; i < datacnt; ++i) {
+-    total_crypto_overhead -= 1 + ngtcp2_put_uvarintlen(offsets[i]) +
+-                             ngtcp2_put_uvarintlen(data[i].len);
++  used = datalen;
++  for (i = 0; i < datacnt; ++i) {
++    used += 1 + ngtcp2_put_uvarintlen(offsets[i]) +
++            ngtcp2_put_uvarintlen(data[i].len);
+   }
++  assert(used <= left);
+ 
+   datacnt = ngtcp2_pkt_append_ping_and_padding(data, datacnt, &conn->pcg,
+-                                               total_crypto_overhead);
++                                               left - used);
+ 
+   ngtcp2_pkt_permutate_vec(data, datacnt, offsets, &conn->pcg);
+ 
