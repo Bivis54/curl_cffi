@@ -610,6 +610,10 @@ class CurlWsFlag(IntEnum):
     PING = 1 << 4
     OFFSET = 1 << 5
     PONG = 1 << 6
+    # Set on receive when the frame carried RSV1, i.e. a permessage-deflate
+    # compressed payload (RFC 7692). Requires a libcurl built with the
+    # websocket-deflate patch; vanilla libcurl rejects RSV1 outright.
+    DEFLATE = 1 << 7
 
 
 class CurlSslVersion(IntEnum):

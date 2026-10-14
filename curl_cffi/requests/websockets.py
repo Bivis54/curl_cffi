@@ -41,6 +41,8 @@ from time import sleep as sync_sleep
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypeVar, final
 from warnings import warn as user_warning
+from zlib import MAX_WBITS, decompressobj
+from zlib import error as ZlibError
 
 from ..aio import CURL_SOCKET_BAD, get_selector
 from ..const import CurlECode, CurlFollow, CurlInfo, CurlOpt, CurlWsFlag
@@ -53,6 +55,7 @@ from .utils import NOT_SET, HttpVersionLiteral, NotSetType, set_curl_options
 if TYPE_CHECKING:
     from typing import ClassVar, Final
     from weakref import ReferenceType
+    from zlib import _Decompress as ZlibDecompressor  # pyright: ignore[reportPrivateUsage]
 
     from ..const import CurlHttpVersion
     from ..curl import CurlWsFrame
@@ -76,6 +79,15 @@ EventTypeLiteral = Literal["open", "close", "data", "message", "error"]
 # Bound struct methods
 _STRUCT_PACK_CLOSE: Final[Callable[..., bytes]] = Struct("!H").pack
 _STRUCT_UNPACK_CLOSE: Final[Callable[..., tuple[int, ...]]] = Struct("!H").unpack_from
+
+# include/curl/websockets.h. curl >= 8.21.0 queues its auto-PONG in ws->pending
+# and only flushes it at the end of curl_ws_recv(); a reader that sees nothing
+# but a PING returns earlier with CURLE_AGAIN, so the PONG is never sent and the
+# server drops us on its ping timeout. We disable it and reply ourselves.
+CURLWS_NOAUTOPONG: Final = 1 << 1
+
+# RFC 7692 7.2.2: the sender strips this empty stored block from every message.
+_DEFLATE_TAIL: Final = b"\x00\x00\xff\xff"
 
 
 @dataclass
@@ -394,6 +406,7 @@ class WebSocket(BaseWebSocket):
 
     __slots__: ClassVar[tuple[str, ...]] = (
         "_emitters",
+        "_inflator",
         "_read_selector",
         "_recv_chunks",
         "_recv_msg_size",
@@ -450,6 +463,10 @@ class WebSocket(BaseWebSocket):
         self._write_selector: BaseSelector | None = None
         self._recv_chunks: list[bytes] = []
         self._recv_msg_size: int = 0
+        # Lazily created inflater for permessage-deflate. Kept for the whole
+        # connection because the extension shares the LZ77 window between
+        # messages unless the server asked for no_context_takeover.
+        self._inflator: ZlibDecompressor | None = None
 
         self._emitters: dict[EventTypeLiteral, Callable[..., object]] = {}
         if on_open:
@@ -619,7 +636,7 @@ class WebSocket(BaseWebSocket):
     ) -> WebSocket:
         """Connect to the WebSocket.
 
-        libcurl automatically handles pings and pongs.
+        Incoming pings are answered with pongs by the receive methods.
         ref: https://curl.se/libcurl/c/libcurl-ws.html
 
         Args:
@@ -669,6 +686,7 @@ class WebSocket(BaseWebSocket):
 
         # Reset socket and selector cache
         self._sock_fd = -1
+        self._inflator = None
         if self._read_selector is not None:
             self._read_selector.close()
             self._read_selector = None
@@ -716,6 +734,7 @@ class WebSocket(BaseWebSocket):
             # Magic number defined in: https://curl.se/docs/websocket.html
             _ = curl.setopt(CurlOpt.TCP_NODELAY, 1)
             _ = curl.setopt(CurlOpt.CONNECT_ONLY, 2)
+            _ = curl.setopt(CurlOpt.WS_OPTIONS, CURLWS_NOAUTOPONG)
             curl.perform()
 
         except BaseException:
@@ -782,6 +801,7 @@ class WebSocket(BaseWebSocket):
         # Merged bitmasks to minimize hot-loop branching
         close_flag: int = int(CurlWsFlag.CLOSE)
         cont_flag: int = int(CurlWsFlag.CONT)
+        ping_flag: int = int(CurlWsFlag.PING)
         data_mask: int = CurlWsFlag.BINARY | CurlWsFlag.TEXT | cont_flag
 
         try:
@@ -794,8 +814,12 @@ class WebSocket(BaseWebSocket):
 
                     flags = frame.flags
 
+                    if flags & ping_flag:
+                        with suppress(CurlError):
+                            _ = self.send(chunk, CurlWsFlag.PONG)
+
                     # Data Frames (Text / Binary / Cont)
-                    if flags & data_mask:
+                    elif flags & data_mask:
                         # Perform message size checks
                         msg_size += len(chunk)
                         if msg_size > max_message_size:
@@ -813,8 +837,9 @@ class WebSocket(BaseWebSocket):
                         # If the message is complete, process and return
                         if frame.bytesleft == 0 and not (flags & cont_flag):
                             message_completed = True
-                            return (
-                                chunks[0] if len(chunks) == 1 else b"".join(chunks)
+                            return self._inflate(
+                                chunks[0] if len(chunks) == 1 else b"".join(chunks),
+                                flags,
                             ), flags
 
                     # If a CLOSE frame is received, the reader is done.
@@ -961,10 +986,50 @@ class WebSocket(BaseWebSocket):
             raise WebSocketClosed("WebSocket is already closed")
 
         chunk, frame = self.curl.ws_recv()
+
+        if frame.flags & CurlWsFlag.PING:
+            # RFC 6455 5.5.3: a pong must echo the ping payload. A failure here
+            # means the connection is already broken; the next read reports it.
+            with suppress(CurlError):
+                _ = self.send(chunk, CurlWsFlag.PONG)
+
         if frame.flags & CurlWsFlag.CLOSE:
             self._handle_close_frame(chunk)
 
         return chunk, frame
+
+    def _inflate(self, msg: bytes, flags: int) -> bytes:
+        """Inflate a permessage-deflate payload (RFC 7692).
+
+        Only frames that actually carried RSV1 are touched, so this is a no-op
+        unless the extension was negotiated. Negotiating it is up to the caller:
+        the ``Sec-WebSocket-Extensions`` header must be supplied with the
+        handshake headers, because its position and value are part of the
+        browser fingerprint and cannot be guessed by the library.
+        """
+        if not (flags & CurlWsFlag.DEFLATE):
+            return msg
+        if self._inflator is None:
+            self._inflator = decompressobj(-MAX_WBITS)
+        limit: int = self._max_message_size
+        try:
+            data: bytes = self._inflator.decompress(msg + _DEFLATE_TAIL, limit + 1)
+        except ZlibError as e:
+            # The deflate stream is shared across messages, so one bad frame
+            # desynchronises everything after it. Fail loudly instead of handing
+            # back garbage: the caller can reconnect with a clean inflater.
+            self._inflator = None
+            raise WebSocketError(
+                f"permessage-deflate: failed to inflate payload: {e}",
+                WsCloseCode.INVALID_DATA,
+            ) from e
+        if len(data) > limit:
+            self._inflator = None
+            raise WebSocketError(
+                f"Message too large: inflated payload exceeds {limit} bytes.",
+                WsCloseCode.MESSAGE_TOO_BIG,
+            )
+        return data
 
     def send(
         self,
@@ -1242,7 +1307,7 @@ class WebSocket(BaseWebSocket):
         The connection is always terminated when this method returns,
         including when it exits by exception.
 
-        libcurl automatically handles pings and pongs.
+        Incoming pings are answered with pongs.
         ref: https://curl.se/libcurl/c/libcurl-ws.html
 
         Raises:
@@ -1286,6 +1351,7 @@ class WebSocket(BaseWebSocket):
         has_message_emitter: bool = "message" in self._emitters
         close_flag: int = int(CurlWsFlag.CLOSE)
         cont_flag: int = int(CurlWsFlag.CONT)
+        deflate_flag: int = int(CurlWsFlag.DEFLATE)
         data_mask: int = CurlWsFlag.BINARY | CurlWsFlag.TEXT | cont_flag
         leave_open: bool = False
 
@@ -1321,11 +1387,16 @@ class WebSocket(BaseWebSocket):
                         if not (frame.bytesleft == 0 and not (flags & cont_flag)):
                             continue
 
-                        if has_message_emitter:
-                            msg: bytes = (
-                                chunks[0] if len(chunks) == 1 else b"".join(chunks)
+                        # Compressed messages are inflated even without a listener:
+                        # the inflater window must see every message in order.
+                        msg: bytes = b""
+                        if has_message_emitter or flags & deflate_flag:
+                            msg = self._inflate(
+                                chunks[0] if len(chunks) == 1 else b"".join(chunks),
+                                flags,
                             )
 
+                        if has_message_emitter:
                             if (
                                 flags & CurlWsFlag.TEXT
                             ) and not self.skip_utf8_validation:
@@ -1353,8 +1424,13 @@ class WebSocket(BaseWebSocket):
                         leave_open = not self.autoclose
                         break
 
-                    # Silently consume PING/PONG and loop again
-                    if flags & (CurlWsFlag.PING | CurlWsFlag.PONG):
+                    if flags & CurlWsFlag.PING:
+                        with suppress(CurlError):
+                            _ = self.send(chunk, CurlWsFlag.PONG)
+                        continue
+
+                    # Silently consume PONG and loop again
+                    if flags & CurlWsFlag.PONG:
                         continue
 
                 except CurlError as e:
@@ -2317,6 +2393,7 @@ class AsyncWebSocket(BaseWebSocket):
         e_nothing: int = int(CurlECode.GOT_NOTHING)
         close_flag: int = int(CurlWsFlag.CLOSE)
         cont_flag: int = int(CurlWsFlag.CONT)
+        ping_flag: int = int(CurlWsFlag.PING)
         data_mask: int = CurlWsFlag.BINARY | CurlWsFlag.TEXT | cont_flag
         max_msg_size: int = self._max_message_size
         block_on_recv: bool = self._block_on_recv_queue_full
@@ -2398,8 +2475,13 @@ class AsyncWebSocket(BaseWebSocket):
                 if recv_error_retries > 0:
                     recv_error_retries = 0
 
+                # See CURLWS_NOAUTOPONG: libcurl no longer answers pings for us.
+                if flags & ping_flag:
+                    with suppress(QueueFull):
+                        self._send_queue.put_nowait((chunk, CurlWsFlag.PONG))
+
                 # Data Frames (Text / Binary / Cont)
-                if flags & data_mask:
+                elif flags & data_mask:
                     # Perform message size checks
                     msg_size += len(chunk)
 
