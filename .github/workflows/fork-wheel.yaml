@@ -91,8 +91,8 @@ jobs:
     - name: Install wheel
       run: |
         python -m venv /tmp/venv
-        /tmp/venv/bin/pip install wheelhouse/*.whl pytest pytest-asyncio websockets trustme
-        /tmp/venv/bin/python -c "import curl_cffi; print(curl_cffi.__version__, curl_cffi.__curl_version__)"
+        /tmp/venv/bin/pip install wheelhouse/*.whl pytest pytest-asyncio websockets trustme aioquic
+        cd /tmp && /tmp/venv/bin/python -c "import curl_cffi; print(curl_cffi.__version__, curl_cffi.__curl_version__)"
 
     - name: Fingerprint snapshot
       run: |
