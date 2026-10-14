@@ -125,11 +125,12 @@ jobs:
         /tmp/venv/bin/python $bench/capture_curl_cffi.py \
           --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-direct
         /tmp/venv/bin/python $bench/socks5_udp.py 1080 "$GITHUB_WORKSPACE/results/socks5-proxy.log" &
+        proxy=$!
         sleep 2
         /tmp/venv/bin/python $bench/capture_curl_cffi.py \
           --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-socks5 \
           --proxy socks5h://user:pass@127.0.0.1:1080
-        kill %1
+        kill $proxy
 
     - name: Compare with Chrome
       working-directory: /tmp/ci/tests
