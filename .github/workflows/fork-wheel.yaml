@@ -1,0 +1,125 @@
+name: Fork wheel
+run-name: Fork wheel ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/**
+    tags:
+      - chrome152-*
+
+permissions:
+  contents: read
+
+jobs:
+  libcurl:
+    name: Build libcurl-impersonate (x86_64-linux-gnu)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: out/libdir
+        key: libcurl-impersonate-x86_64-linux-gnu-${{ hashFiles('native/**', 'scripts/build_libcurl_impersonate.sh') }}
+
+    - name: Install build dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config cmake ninja-build autoconf automake libtool gperf golang-go
+        source native/curl-impersonate.env
+        curl -sSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        tar xf zig.tar.xz -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+    - name: Build
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: scripts/build_libcurl_impersonate.sh out
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: libcurl-impersonate-x86_64-linux-gnu
+        path: out/libdir
+
+  wheel:
+    name: Build cp310-abi3 manylinux x86_64 wheel
+    needs: libcurl
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: libcurl-impersonate-x86_64-linux-gnu
+        path: tmplibdir
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Build and test wheel
+      uses: pypa/cibuildwheel@v3.3.1
+      env:
+        CIBW_BUILD: cp310-manylinux_x86_64
+        CIBW_ARCHS_LINUX: x86_64
+        CIBW_ENVIRONMENT_LINUX: IMPERSONATE_BUILD_DIR=/project/tmplibdir
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: wheelhouse/*.whl
+
+  bench:
+    name: Verify on Ubuntu 24.04
+    needs: wheel
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: wheelhouse
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install wheel
+      run: |
+        python -m venv /tmp/venv
+        /tmp/venv/bin/pip install wheelhouse/*.whl pytest pytest-asyncio websockets trustme
+        /tmp/venv/bin/python -c "import curl_cffi; print(curl_cffi.__version__, curl_cffi.__curl_version__)"
+
+    - name: Fingerprint snapshot
+      run: |
+        cd /tmp
+        /tmp/venv/bin/python "$GITHUB_WORKSPACE/tests/quic_bench/capture_curl_cffi.py" \
+          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: snapshot-fork-wheel
+        path: snapshots/
+
+  release:
+    name: Publish pre-release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [wheel, bench]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: dist
+
+    - uses: softprops/action-gh-release@v2
+      with:
+        prerelease: true
+        files: dist/*.whl
