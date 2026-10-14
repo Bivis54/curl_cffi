@@ -55,6 +55,9 @@ jobs:
 
   bdist:
     name: Build bdist wheels and test
+    # Forks carry native patches that only fork-wheel.yaml builds; these jobs
+    # link upstream's prebuilt libcurl-impersonate instead.
+    if: github.repository == 'lexiforest/curl_cffi'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -89,6 +92,7 @@ jobs:
 
   bdist_android:
     name: Build Android wheels
+    if: github.repository == 'lexiforest/curl_cffi'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -130,6 +134,7 @@ jobs:
   # Make our build process future-proof
   build_latest:
     name: Build bdist on latest OSes
+    if: github.repository == 'lexiforest/curl_cffi'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
