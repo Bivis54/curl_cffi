@@ -2,9 +2,10 @@
 
 Answers every request with JSON describing the connection: whether the TLS
 session was resumed, whether the request arrived as 0-RTT early data, and the
-request headers. Session tickets are kept in memory so clients can resume;
---reject-early-data forgets them, so a client offering 0-RTT gets a full
-handshake and has to send its request again.
+request headers; "?size=N" pads the response to about N bytes. Session tickets
+are kept in memory so clients can resume; --reject-early-data forgets them, so
+a client offering 0-RTT gets a full handshake and has to send its request
+again.
 
 usage: h3_server.py PORT [--log FILE] [--reject-early-data]
        [--cert FILE --key FILE]   (a self-signed localhost cert by default)
@@ -18,6 +19,7 @@ import datetime
 import json
 import tempfile
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.h3.connection import H3_ALPN, H3Connection
@@ -105,6 +107,9 @@ class Handler(QuicConnectionProtocol):
         if self.log_path:
             with open(self.log_path, "a") as f:
                 f.write(json.dumps(info) + "\n")
+        path = dict(ev.headers).get(b":path", b"/").decode()
+        size = int(parse_qs(urlsplit(path).query).get("size", ["0"])[0])
+        info["pad"] = "x" * size
         body = json.dumps(info).encode()
         assert self._http is not None
         self._http.send_headers(

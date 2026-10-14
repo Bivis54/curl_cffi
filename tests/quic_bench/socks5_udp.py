@@ -325,7 +325,7 @@ class Proxy:
                 else:
                     queue.append(reply_header(src) + data)
                 if args.batch > 1:
-                    out.settimeout(0.002)
+                    out.settimeout(0.01)
                     while len(queue) < args.batch:
                         try:
                             more, msrc = out.recvfrom(65535)
