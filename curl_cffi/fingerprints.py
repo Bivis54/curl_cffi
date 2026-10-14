@@ -177,6 +177,14 @@ NATIVE_IMPERSONATE_TARGETS = [
     },
     {
         "browser": "Chrome",
+        "version": "152",
+        "os": "Windows",
+        "os_version": "10",
+        "target_name": "chrome152",
+        "h3_fingerprints": True,
+    },
+    {
+        "browser": "Chrome",
         "version": "99",
         "os": "Android",
         "os_version": "12",
