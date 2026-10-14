@@ -1,8 +1,9 @@
 """Local HTTP/3 test server (aioquic) for offline QUIC tests.
 
 Answers every request with JSON describing the connection: whether the TLS
-session was resumed, whether the request arrived as 0-RTT early data, and the
-request headers; "?size=N" pads the response to about N bytes. Session tickets
+session was resumed, whether the request arrived as 0-RTT early data, the
+request headers and which datagrams carried the control stream and the
+request; "?size=N" pads the response to about N bytes. Session tickets
 are kept in memory so clients can resume; --reject-early-data forgets them, so
 a client offering 0-RTT gets a full handshake and has to send its request
 again.
@@ -25,12 +26,14 @@ from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ProtocolNegotiated, QuicEvent
+from aioquic.quic.events import ProtocolNegotiated, QuicEvent, StreamDataReceived
 from aioquic.tls import SessionTicket
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+
+CLIENT_CONTROL_STREAM = 2  # the client's first unidirectional stream
 
 
 def self_signed(directory: Path) -> tuple[Path, Path]:
@@ -84,8 +87,20 @@ class Handler(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._http: H3Connection | None = None
+        self._datagrams = 0
+        self._control_datagram: int | None = None
+
+    def datagram_received(self, data, addr) -> None:
+        self._datagrams += 1
+        super().datagram_received(data, addr)
 
     def quic_event_received(self, event: QuicEvent) -> None:
+        if (
+            isinstance(event, StreamDataReceived)
+            and event.stream_id == CLIENT_CONTROL_STREAM
+            and self._control_datagram is None
+        ):
+            self._control_datagram = self._datagrams
         if isinstance(event, ProtocolNegotiated) and event.alpn_protocol in H3_ALPN:
             self._http = H3Connection(self._quic)
         if self._http is None:
@@ -103,6 +118,10 @@ class Handler(QuicConnectionProtocol):
             ),
             "stream_id": ev.stream_id,
             "headers": [(k.decode(), v.decode()) for k, v in ev.headers],
+            # Which received datagram first carried the client's control
+            # stream, and which one completed the request headers.
+            "control_datagram": self._control_datagram,
+            "headers_datagram": self._datagrams,
         }
         if self.log_path:
             with open(self.log_path, "a") as f:
