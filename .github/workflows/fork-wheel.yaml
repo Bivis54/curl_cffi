@@ -134,6 +134,14 @@ jobs:
         done
         exit $status
 
+    - name: Google over HTTP/3 with trust anchor IDs
+      working-directory: /tmp/ci/tests
+      env:
+        RUN_LIVE_TESTS: "1"
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -rA integration/test_quic_fingerprint.py -k google \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/google-http3.log"
+
     - name: Real SOCKS5 UDP proxies
       # The maintainer's public test proxies are not always up.
       continue-on-error: true
