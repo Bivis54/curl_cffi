@@ -245,6 +245,7 @@ class Proxy:
             "up": 0,
             "down": 0,
             "dst": [],
+            "sources": [],
             "violations": 0,
             "dns": 0,
             "dropped": 0,
@@ -296,6 +297,9 @@ class Proxy:
                 out.sendto(payload, (ip, port))
 
         def reply_header(src: tuple[str, int]) -> bytes:
+            key = f"{src[0]}:{src[1]}"
+            if key not in st["sources"]:
+                st["sources"].append(key)
             mode = args.reply_src
             if mode == "zero":
                 return b"\x00\x00\x00\x01" + b"\x00" * 6
@@ -390,6 +394,7 @@ class Proxy:
                 "up": st["up"],
                 "down": st["down"],
                 "dst": st["dst"],
+                "sources": st["sources"],
                 "violations": st["violations"],
                 "dns": st["dns"],
                 "dropped": st["dropped"],

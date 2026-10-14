@@ -57,3 +57,27 @@ def test_tcp_matches_chrome(snapshot, reference):
         pytest.skip(f"tls.peet.ws unavailable: {snapshot['peet']}")
     failed = comparator_failures(reference, snapshot)
     assert [name for name in failed if name.startswith("tcp.")] == []
+
+
+def test_google_http3_certificate_verifies():
+    """Google leaves the intermediate out over QUIC for the trust anchor IDs
+    Chrome sends, so the client has to hold it."""
+    from curl_cffi import CurlECode, CurlError, requests
+
+    errors = []
+    for _ in range(3):
+        try:
+            r = requests.get(
+                "https://www.google.com/",
+                impersonate="chrome",
+                http_version="v3only",
+                proxy=os.environ.get("FINGERPRINT_PROXY"),
+                timeout=15,
+            )
+        except CurlError as e:
+            assert e.code != CurlECode.PEER_FAILED_VERIFICATION, e
+            errors.append(repr(e))
+            continue
+        assert (r.status_code, r.http_version) == (200, 30)
+        return
+    pytest.skip(f"no HTTP/3 handshake with www.google.com: {errors}")
