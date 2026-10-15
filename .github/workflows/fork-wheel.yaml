@@ -118,34 +118,41 @@ jobs:
           integration/test_http3_early_data.py \
           2>&1 | tee "$GITHUB_WORKSPACE/results/integration.log"
 
-    - name: Fingerprint snapshots (direct and through a local SOCKS5 proxy)
-      working-directory: /tmp
-      run: |
-        bench=/tmp/ci/tests/quic_bench
-        /tmp/venv/bin/python $bench/capture_curl_cffi.py \
-          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-direct
-        /tmp/venv/bin/python $bench/socks5_udp.py 1080 "$GITHUB_WORKSPACE/results/socks5-proxy.log" &
-        proxy=$!
-        sleep 2
-        /tmp/venv/bin/python $bench/capture_curl_cffi.py \
-          --out "$GITHUB_WORKSPACE/snapshots" --label fork-wheel-socks5 \
-          --proxy socks5h://user:pass@127.0.0.1:1080
-        kill $proxy
-
-    - name: Compare with Chrome
+    - name: Fingerprint snapshots compared with Chrome
       working-directory: /tmp/ci/tests
       run: |
-        status=0
-        compare() {
-          /tmp/venv/bin/python quic_bench/fingerprint_diff.py "groundtruth/$1.json" \
-            "$GITHUB_WORKSPACE/snapshots/$2.json" \
-            | tee "$GITHUB_WORKSPACE/results/diff-$2-$1.txt" || status=1
+        py=/tmp/venv/bin/python
+        snapshots="$GITHUB_WORKSPACE/snapshots"
+        results="$GITHUB_WORKSPACE/results"
+        $py quic_bench/socks5_udp.py 1080 "$results/socks5-proxy.log" &
+        proxy=$!
+        sleep 2
+        # check LABEL PROXY_URL REFERENCE...: capture and diff, and capture once
+        # more on failure. quic.browserleaks.com reads the HTTP/3 control and
+        # request streams concurrently and now and then reports a request
+        # before control frames it already received (FINDINGS.md, section 6).
+        check() {
+          local label=$1 url=$2 attempt ref ok
+          shift 2
+          for attempt in 1 2; do
+            (cd /tmp && $py /tmp/ci/tests/quic_bench/capture_curl_cffi.py \
+              --out "$snapshots" --label "$label-$attempt" ${url:+--proxy "$url"})
+            ok=1
+            for ref in "$@"; do
+              $py quic_bench/fingerprint_diff.py "groundtruth/$ref.json" \
+                "$snapshots/$label-$attempt.json" > "$results/diff-$label-$attempt-$ref.txt" || ok=0
+              cat "$results/diff-$label-$attempt-$ref.txt"
+            done
+            [ $ok = 1 ] && return 0
+          done
+          return 1
         }
+        status=0
         # Direct connections get ECH configs from DNS, like Chrome; behind a
         # proxy neither has them and both use GREASE ECH.
-        compare chrome154_dns_ech fork-wheel-direct
-        compare chrome155 fork-wheel-socks5
-        compare chrome152 fork-wheel-socks5
+        check fork-wheel-direct "" chrome154_dns_ech || status=1
+        check fork-wheel-socks5 socks5h://user:pass@127.0.0.1:1080 chrome155 chrome152 || status=1
+        kill $proxy
         exit $status
 
     - name: Google over HTTP/3 with trust anchor IDs
