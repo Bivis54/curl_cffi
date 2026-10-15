@@ -199,13 +199,16 @@ IMPERSONATE_H3 = "https://fp.impersonate.pro/api/http3"
 
 @pytest.mark.skipif(not REAL_PROXIES, reason="SOCKS5_UDP_PROXIES not set")
 @pytest.mark.parametrize(
-    "proxy", REAL_PROXIES, ids=lambda p: f"{urlsplit(p).hostname}:{urlsplit(p).port}"
+    # By index, so that test ids and failure reports never show credentials.
+    "index",
+    range(len(REAL_PROXIES)),
+    ids=[f"{urlsplit(p).hostname}:{urlsplit(p).port}" for p in REAL_PROXIES],
 )
 @pytest.mark.parametrize("http_version", ["v3only", "v3"])
 @pytest.mark.parametrize("scheme", ["socks5h", "socks5"])
-def test_real_proxy(proxy, scheme, http_version):
+def test_real_proxy(index, scheme, http_version):
     """Three QUIC connections, two origins: each needs its own association."""
-    proxy = scheme + "://" + proxy.split("://", 1)[-1]
+    proxy = scheme + "://" + REAL_PROXIES[index].split("://", 1)[-1]
     options = {CurlOpt.FORBID_REUSE: 1}
     if http_version == "v3":
         # "v3" races a TCP connection after 100 ms without QUIC data, which is
@@ -229,5 +232,7 @@ def test_real_proxy(proxy, scheme, http_version):
     assert fresh["ja4"] == "q13d0312h3_55b375c5d22e_178839b6cec1"
     assert resumed["ja4"] == "q13d0314h3_55b375c5d22e_79cc91d6b50c"
     assert resumed["quic"]["0-rtt"]
-    for data in (fresh, resumed):
-        assert data["h3_hash"] == "ba909fc3dc419ea5c5b26c6323ac1879"
+    texts = {"fresh": fresh["h3_text"], "resumed": resumed["h3_text"]}
+    assert [fresh["h3_hash"], resumed["h3_hash"]] == [
+        "ba909fc3dc419ea5c5b26c6323ac1879"
+    ] * 2, texts
