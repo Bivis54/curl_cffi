@@ -612,10 +612,12 @@ class Curl:
         self, clear_headers: bool = True, clear_resolve: bool = True
     ) -> None:
         """Clean up handles and buffers after ``perform`` and ``close``,
-        called at the end of ``perform`` and ``close``."""
+        called at the end of ``perform`` and ``close``. The debug callback is
+        kept: libcurl logs through it until the handle is reset or closed."""
+        if self._debug_handle is not None:
+            ffi.from_handle(self._debug_handle).exception = None
         self._write_handle = None
         self._header_handle = None
-        self._debug_handle = None
         self._body_handle = None
         self._read_handle = None
         self._seek_handle = None
@@ -655,7 +657,11 @@ class Curl:
         self._skip_cacert = False
         if self._curl is not None:
             lib.curl_easy_reset(self._curl)
+            # Before _set_error_buffer(), which installs a new one for debug=True.
+            self._debug_handle = None
             self._set_error_buffer()
+        else:
+            self._debug_handle = None
         self._resolve = ffi.NULL
 
     def parse_cookie_headers(self, headers: list[bytes]) -> SimpleCookie:
@@ -705,11 +711,13 @@ class Curl:
 
     def close(self) -> None:
         """Close and cleanup curl handle, wrapper for ``curl_easy_cleanup``."""
-        self.clean_handles_and_buffers()
-
         if self._curl:
+            # Cleanup can still call the callbacks, e.g. to log closing the
+            # connections; their contexts are released afterwards.
             lib.curl_easy_cleanup(self._curl)
             self._curl = None
+        self.clean_handles_and_buffers()
+        self._debug_handle = None
         ffi.release(self._error_buffer)
 
         if self._ws_recv_buffer is not None:

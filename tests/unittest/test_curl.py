@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import subprocess
+import sys
 from importlib import import_module
 from io import BytesIO
 from typing import cast
@@ -174,6 +176,52 @@ def test_debug_function_exception(server):
     c.setopt(CurlOpt.DEBUGFUNCTION, debug)
     with pytest.raises(ValueError, match="debug callback failed"):
         c.perform()
+
+
+DEBUG_AFTER_PERFORM = """
+import sys
+from io import BytesIO
+from curl_cffi import Curl, CurlOpt
+
+calls = []
+
+def debug(kind, data):
+    calls.append(kind)
+    if sys.argv[2] == "raise" and len(calls) == 1:
+        raise ValueError("debug callback failed")
+
+c = Curl()
+c.setopt(CurlOpt.URL, sys.argv[1])
+c.setopt(CurlOpt.VERBOSE, 1)
+c.setopt(CurlOpt.DEBUGFUNCTION, debug)
+for n in range(2):
+    c.setopt(CurlOpt.WRITEDATA, BytesIO())
+    try:
+        c.perform()
+    except ValueError:
+        if n:
+            raise
+first = len(calls)
+c.close()
+print(first, len(calls))
+"""
+
+
+@pytest.mark.parametrize("callback", ["log", "raise"])
+def test_debug_function_after_perform(server, callback):
+    # libcurl logs through the debug callback on the next perform() and while
+    # closing the connections in curl_easy_cleanup(). A freed callback
+    # context aborts the interpreter, hence the subprocess. An exception from
+    # the callback fails only the perform() it happened in.
+    result = subprocess.run(
+        [sys.executable, "-c", DEBUG_AFTER_PERFORM, str(server.url), callback],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    before_close, after_close = map(int, result.stdout.split())
+    assert 1 < before_close <= after_close
 
 
 def test_read_function(server):
