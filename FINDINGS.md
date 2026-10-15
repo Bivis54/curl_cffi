@@ -176,7 +176,7 @@ Levers (`native/patches/`):
   only SETTINGS and HEADERS for 2 of 20 resumed connections (`h3_hash`
   mismatch). Chrome sends the control stream in its first flight and the
   request in a later packet (seen in a decrypted local capture); curl now does
-  the same, and 40 of 40 resumed connections were correct afterwards.
+  the same, and 100 of 100 resumed connections were correct afterwards.
 - **Transport parameter details**: GREASE TP with 0-15 random bytes and a
   random GREASE position in `version_information`, both like Chromium.
 - **TCP**: `CURLOPT_TLS_GREASE_SIGALGS` (BoringSSL
@@ -236,6 +236,14 @@ Chrome 155 and 152 captures; both show 0 failed checks.
   attempts the relay returns a single datagram from Google. Other QUIC sites work
   through the same relays, and Google works from CI with direct UDP
   (`test_google_http3_certificate_verifies`).
+- **First request timing.** On new connections curl sends the request in the
+  same burst as its handshake Finished, about 0.06 ms after the packet with
+  the control stream; Chrome's request followed about 2 ms later in a local
+  capture (the packet layout is otherwise the same). quic.browserleaks.com
+  reads the control and request streams concurrently, so for 3 of 60 new
+  connections it reported GREASE or PRIORITY_UPDATE missing and a different
+  `h3_hash`. The spacing is visible on the wire. CI captures once more
+  before failing the Chrome comparison.
 - **QPACK differs from Chrome, visible to the server only** (decrypted local
   captures). Chrome opens its QPACK encoder stream with the first request,
   inserts most headers into the dynamic table (about 400 bytes of encoder
