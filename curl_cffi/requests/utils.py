@@ -362,6 +362,24 @@ def set_extra_fp(curl: Curl, fp: ExtraFingerprints):
         curl.setopt(CurlOpt.HTTP3_SIG_HASH_ALGS, fp.http3_sig_hash_algs)
     if fp.http3_tls_extension_order is not None:
         curl.setopt(CurlOpt.HTTP3_TLS_EXTENSION_ORDER, fp.http3_tls_extension_order)
+    if fp.quic_initial_packet_number is not None:
+        curl.setopt(CurlOpt.QUIC_INITIAL_PACKET_NUMBER, fp.quic_initial_packet_number)
+    _apply_quic_parity(curl, fp)
+
+
+def _apply_quic_parity(curl: Curl, fp: Fingerprint | ExtraFingerprints) -> None:
+    if fp.quic_max_udp_payload_size is not None:
+        curl.setopt(CurlOpt.QUIC_MAX_UDP_PAYLOAD_SIZE, fp.quic_max_udp_payload_size)
+    if fp.quic_address_token is not None:
+        curl.setopt(CurlOpt.QUIC_ADDRESS_TOKEN, int(fp.quic_address_token))
+    if fp.http3_grease_frame is not None:
+        curl.setopt(CurlOpt.HTTP3_GREASE_FRAME, int(fp.http3_grease_frame))
+    if fp.http3_priority_update is not None:
+        curl.setopt(CurlOpt.HTTP3_PRIORITY_UPDATE, int(fp.http3_priority_update))
+    if fp.http3_earlydata is not None:
+        curl.setopt(CurlOpt.HTTP3_EARLYDATA, int(fp.http3_earlydata))
+    if fp.tls_grease_sigalgs is not None:
+        curl.setopt(CurlOpt.TLS_GREASE_SIGALGS, int(fp.tls_grease_sigalgs))
 
 
 def _normalize_tls_version(version: str) -> CurlSslVersion:
@@ -447,7 +465,9 @@ def _apply_fingerprint(
     # Explicit extension orders are also allowlists in our BoringSSL fork, so
     # enable browser capabilities here and let the selected order suppress them.
     curl.setopt(CurlOpt.TLS_STATUS_REQUEST, 1)
-    curl.setopt(CurlOpt.TLS_SIGNED_CERT_TIMESTAMPS, 1)
+    curl.setopt(
+        CurlOpt.TLS_SIGNED_CERT_TIMESTAMPS, int(fingerprint.tls_signed_cert_timestamps)
+        )
     curl.setopt(CurlOpt.TLS_KEY_SHARES_LIMIT, fingerprint.tls_key_shares_limit)
 
     if fingerprint.tls_cert_compression:
@@ -482,6 +502,11 @@ def _apply_fingerprint(
 
     if fingerprint.tls_ech is not None:
         curl.setopt(CurlOpt.ECH, fingerprint.tls_ech)
+
+    if fingerprint.tls_trust_anchors is not None:
+        curl.setopt(
+            CurlOpt.TLS_TRUST_ANCHORS, ",".join(fingerprint.tls_trust_anchors)
+        )
 
     # http2 settings
     if fingerprint.http2_settings:
@@ -532,6 +557,11 @@ def _apply_fingerprint(
         )
     if fingerprint.quic_cid_length is not None:
         curl.setopt(CurlOpt.QUIC_CID_LENGTH, fingerprint.quic_cid_length)
+    if fingerprint.quic_initial_packet_number is not None:
+        curl.setopt(
+            CurlOpt.QUIC_INITIAL_PACKET_NUMBER, fingerprint.quic_initial_packet_number
+        )
+    _apply_quic_parity(curl, fingerprint)
 
     # websocket settings
     if fingerprint.ws_header_order:
@@ -614,6 +644,7 @@ def set_curl_options(
     quote: Union[str, Literal[False]] = "",
     http_version: Optional[Union[CurlHttpVersion, HttpVersionLiteral]] = None,
     interface: Optional[str] = None,
+    dns: Optional[Union[str, list[str]]] = None,
     doh_url: Optional[str] = None,
     cert: Optional[Union[str, tuple[str, str]]] = None,
     stream: Optional[bool] = None,
@@ -1023,6 +1054,10 @@ def set_curl_options(
             else:
                 value = f"host!{interface}"
         c.setopt(CurlOpt.INTERFACE, value.encode())
+
+    if dns:
+        servers = dns if isinstance(dns, str) else ",".join(dns)
+        c.setopt(CurlOpt.DNS_SERVERS, servers.encode())
 
     if doh_url:
         c.setopt(CurlOpt.DOH_URL, doh_url.encode())

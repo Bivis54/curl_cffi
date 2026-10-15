@@ -1,0 +1,227 @@
+name: Fork wheel
+run-name: Fork wheel ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/**
+    tags:
+      - chrome152-*
+
+permissions:
+  contents: read
+
+jobs:
+  libcurl:
+    name: Build libcurl-impersonate (x86_64-linux-gnu)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: out/libdir
+        key: libcurl-impersonate-x86_64-linux-gnu-${{ hashFiles('native/**', 'scripts/build_libcurl_impersonate.sh') }}
+
+    - name: Install build dependencies
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config cmake ninja-build autoconf automake libtool gperf golang-go
+        source native/curl-impersonate.env
+        curl -sSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        tar xf zig.tar.xz -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+    - name: Build
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: scripts/build_libcurl_impersonate.sh out
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: libcurl-impersonate-x86_64-linux-gnu
+        path: out/libdir
+
+  wheel:
+    name: Build cp310-abi3 manylinux x86_64 wheel
+    needs: libcurl
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: libcurl-impersonate-x86_64-linux-gnu
+        path: tmplibdir
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Build and test wheel
+      uses: pypa/cibuildwheel@v3.3.1
+      env:
+        CIBW_BUILD: cp310-manylinux_x86_64
+        CIBW_ARCHS_LINUX: x86_64
+        CIBW_ENVIRONMENT_LINUX: IMPERSONATE_BUILD_DIR=/project/tmplibdir
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: wheelhouse/*.whl
+
+  bench:
+    name: Verify on Ubuntu 24.04
+    needs: wheel
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: wheelhouse
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install wheel
+      run: |
+        python -m venv /tmp/venv
+        /tmp/venv/bin/pip install "$(ls wheelhouse/*.whl)[test]" aioquic
+        # Tests run from a copy so that the source tree cannot shadow the wheel.
+        mkdir -p /tmp/ci results
+        cp -r tests assets /tmp/ci/
+        cd /tmp && /tmp/venv/bin/python -c "import curl_cffi; print(curl_cffi.__version__, curl_cffi.__curl_version__)"
+
+    - name: Unit tests
+      working-directory: /tmp/ci/tests
+      run: |
+        # test_get_default_config_dir_* expect XDG_CONFIG_HOME to be unset.
+        env -u XDG_CONFIG_HOME /tmp/venv/bin/python -bb -m pytest unittest -p no:cacheprovider \
+          -o asyncio_mode=auto -q 2>&1 | tee "$GITHUB_WORKSPACE/results/unittest.log"
+
+    - name: Integration tests (SOCKS5 UDP relays, idle wss, CLOSE_WAIT, WebSocket on TCP)
+      working-directory: /tmp/ci/tests
+      env:
+        RUN_SLOW_TESTS: "1"
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -o asyncio_mode=auto -rA -s \
+          integration/test_socks5_udp.py integration/test_close_wait.py \
+          integration/test_websocket_transport.py integration/test_websocket_idle.py \
+          integration/test_http3_early_data.py \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/integration.log"
+
+    - name: Fingerprint snapshots compared with Chrome
+      working-directory: /tmp/ci/tests
+      run: |
+        py=/tmp/venv/bin/python
+        snapshots="$GITHUB_WORKSPACE/snapshots"
+        results="$GITHUB_WORKSPACE/results"
+        $py quic_bench/socks5_udp.py 1080 "$results/socks5-proxy.log" &
+        proxy=$!
+        sleep 2
+        # check LABEL PROXY_URL REFERENCE...: capture and diff, and capture once
+        # more on failure. quic.browserleaks.com reads the HTTP/3 control and
+        # request streams concurrently and now and then reports a request
+        # before control frames it already received (FINDINGS.md, section 6).
+        check() {
+          local label=$1 url=$2 attempt ref ok
+          shift 2
+          for attempt in 1 2; do
+            (cd /tmp && $py /tmp/ci/tests/quic_bench/capture_curl_cffi.py \
+              --out "$snapshots" --label "$label-$attempt" ${url:+--proxy "$url"})
+            ok=1
+            for ref in "$@"; do
+              $py quic_bench/fingerprint_diff.py "groundtruth/$ref.json" \
+                "$snapshots/$label-$attempt.json" > "$results/diff-$label-$attempt-$ref.txt" || ok=0
+              cat "$results/diff-$label-$attempt-$ref.txt"
+            done
+            [ $ok = 1 ] && return 0
+          done
+          return 1
+        }
+        status=0
+        # Direct connections get ECH configs from DNS, like Chrome; behind a
+        # proxy neither has them and both use GREASE ECH.
+        check fork-wheel-direct "" chrome154_dns_ech || status=1
+        check fork-wheel-socks5 socks5h://user:pass@127.0.0.1:1080 chrome155 chrome152 || status=1
+        kill $proxy
+        exit $status
+
+    - name: Google over HTTP/3 with trust anchor IDs
+      working-directory: /tmp/ci/tests
+      env:
+        RUN_LIVE_TESTS: "1"
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -rA integration/test_quic_fingerprint.py -k google \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/google-http3.log"
+
+    - name: Real SOCKS5 UDP proxies
+      # The maintainer's public test proxies are not always up.
+      continue-on-error: true
+      working-directory: /tmp/ci/tests
+      env:
+        SOCKS5_UDP_PROXIES: socks5h://imp:curl-cffi@206.189.95.199:1080,socks5h://imp:curl-cffi@24.144.88.46:1080
+      run: |
+        /tmp/venv/bin/python -m pytest -p no:cacheprovider -rA integration/test_socks5_udp.py -k real_proxy \
+          2>&1 | tee "$GITHUB_WORKSPACE/results/real-proxies.log"
+
+    - name: Real-proxy scripts against local proxies
+      working-directory: /tmp
+      run: |
+        bench=/tmp/ci/tests/quic_bench
+        results="$GITHUB_WORKSPACE/results"
+        /tmp/venv/bin/python $bench/socks5_udp.py 1082 "$results/script-proxy-plain.log" &
+        plain=$!
+        /tmp/venv/bin/python $bench/socks5_udp.py 1083 "$results/script-proxy-single-target.log" \
+          --single-target --require-auth &
+        single=$!
+        sleep 2
+        status=0
+        diag=0
+        export PROXYSHARD_SOCKS5_URL=socks5h://user:pass@127.0.0.1:1082
+        export SOAX_SOCKS5_URL=socks5h://user:pass@127.0.0.1:1083
+        # The local proxies exit from this runner, hence --no-exit-ip-check.
+        /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/test_real_proxies.py" \
+          --no-exit-ip-check --rounds 2 --json "$results/test_real_proxies.json" \
+          | tee "$results/test_real_proxies.txt" || status=$?
+        /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/diagnose_real_proxies.py" \
+          --direct --no-exit-ip-check --trace-dir "$results/diagnose-traces" \
+          --json "$results/diagnose.json" | tee "$results/diagnose.txt" || diag=$?
+        kill $plain $single
+        # 1 means some request failed, reported above; anything else is a
+        # broken script (2 no provider, 3 exception, 134 an abort).
+        [ $status -le 1 ] && [ $diag -le 1 ]
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: bench-results
+        path: |
+          snapshots/
+          results/
+
+  release:
+    name: Publish pre-release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [wheel, bench]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: curl_cffi-wheel-linux-x86_64
+        path: dist
+
+    - uses: softprops/action-gh-release@v2
+      with:
+        prerelease: true
+        files: dist/*.whl

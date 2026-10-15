@@ -5,8 +5,8 @@ PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
 
 # this is the upstream libcurl-impersonate version
-VERSION := 2.1.0
-CURL_VERSION := curl-8_21_0
+VERSION := 2.2.3
+CURL_VERSION := curl-8_22_0
 
 ifeq ($(OS),Windows_NT)
     CURRENT_USER := $(shell echo %USERNAME%)
@@ -28,6 +28,7 @@ curl-impersonate-$(VERSION)/patches: $(CURL_VERSION)
 	cd $(CURL_VERSION)
 	# for p in $</curl*.patch; do patch -p1 < ../$$p; done
 	patch -p1 < ../$</curl.patch
+	for p in ../native/patches/curl/*.patch; do patch -p1 < $$p; done
 	# Re-generate the configure script
 	autoreconf -fi
 	mkdir -p ../include/curl

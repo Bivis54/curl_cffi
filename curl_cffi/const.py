@@ -315,6 +315,10 @@ class CurlOpt(IntEnum):
     TCP_KEEPCNT = 0 + 326
     UPLOAD_FLAGS = 0 + 327
     SSL_SIGNATURE_ALGORITHMS = 10000 + 328
+    HTTPSIG_ALGORITHM = 0 + 329
+    HTTPSIG_KEY = 10000 + 330
+    HTTPSIG_KEYID = 10000 + 331
+    HTTPSIG_HEADERS = 10000 + 332
     IMPERSONATE = 10000 + 999
     HTTPBASEHEADER = 10000 + 1000
     SSL_SIG_HASH_ALGS = 10000 + 1001
@@ -354,6 +358,16 @@ class CurlOpt(IntEnum):
     WS_SSL_DISABLE_TICKET = 0 + 1036
     WS_SSL_CERT_COMPRESSION = 10000 + 1037
     QUIC_CID_LENGTH = 10000 + 1038
+    HTTP3_SSL_PERMUTE_EXTENSIONS = 0 + 1039
+    TLS_TRUST_ANCHORS = 10000 + 1040
+    QUIC_INITIAL_PACKET_NUMBER = 0 + 1041
+    # Options of the fork's libcurl-impersonate patches (native/patches/curl)
+    QUIC_MAX_UDP_PAYLOAD_SIZE = 0 + 1100
+    HTTP3_GREASE_FRAME = 0 + 1101
+    HTTP3_PRIORITY_UPDATE = 0 + 1102
+    HTTP3_EARLYDATA = 0 + 1103
+    QUIC_ADDRESS_TOKEN = 0 + 1104
+    TLS_GREASE_SIGALGS = 0 + 1105
 
     if locals().get("WRITEDATA"):
         FILE = locals().get("WRITEDATA")
@@ -603,6 +617,10 @@ class CurlWsFlag(IntEnum):
     PING = 1 << 4
     OFFSET = 1 << 5
     PONG = 1 << 6
+    # Set on receive when the frame carried RSV1, i.e. a permessage-deflate
+    # compressed payload (RFC 7692). Requires a libcurl built with the
+    # websocket-deflate patch; vanilla libcurl rejects RSV1 outright.
+    DEFLATE = 1 << 7
 
 
 class CurlSslVersion(IntEnum):

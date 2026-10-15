@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import locale
+import os
 import re
-import struct
 import ssl
+import struct
 import sys
 import warnings
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
-
-import os
 
 import certifi
 
@@ -261,7 +260,7 @@ class Curl:
     Wrapper for ``curl_easy_*`` functions of libcurl.
     """
 
-    _WS_RECV_BUFFER_SIZE = 128 * 1024  # 128 kB
+    _WS_RECV_BUFFER_SIZE: int = 128 * 1024  # 128 kB
 
     def __init__(self, cacert: str = "", debug: bool = False, handle=None) -> None:
         """
@@ -291,10 +290,10 @@ class Curl:
         self._set_error_buffer()
 
         # Pre-allocated CFFI objects for WebSocket performance
-        self._ws_recv_buffer = ffi.new("char[]", self._WS_RECV_BUFFER_SIZE)
-        self._ws_recv_n_recv = ffi.new("size_t *")
-        self._ws_recv_p_frame = ffi.new("struct curl_ws_frame **")
-        self._ws_send_n_sent = ffi.new("size_t *")
+        self._ws_recv_buffer: object | None = None
+        self._ws_recv_n_recv: object = ffi.new("size_t *")
+        self._ws_recv_p_frame: object = ffi.new("struct curl_ws_frame **")
+        self._ws_send_n_sent: object = ffi.new("size_t *")
 
     def _set_error_buffer(self) -> None:
         ret = lib._curl_easy_setopt(self._curl, CurlOpt.ERRORBUFFER, self._error_buffer)
@@ -502,7 +501,7 @@ class Curl:
             0x200000: "long*",
             0x300000: "double*",
             0x400000: "struct curl_slist **",
-            0x500000: "long*",
+            0x500000: "uintptr_t*",
             0x600000: "int64_t*",
         }
         ret_cast_option = {
@@ -522,11 +521,18 @@ class Curl:
             return ret_cast_option[option_type]()
 
         c_value = ffi.new(ret_option[option_type])
-        ret = lib.curl_easy_getinfo(self._curl, option, c_value)
+        if option_type == 0x500000:
+            ret = lib._curl_easy_getinfo_socket(self._curl, option, c_value)
+        else:
+            ret = lib.curl_easy_getinfo(self._curl, option, c_value)
         self._check_error(ret, "getinfo", option)
         # cookielist and ssl_engines starts with 0x400000, see also: const.py
         if option_type == 0x400000:
             return slist_to_list(c_value[0])
+        if option_type == 0x500000:
+            socket = int(c_value[0])
+            socket_bad = int(ffi.cast("uintptr_t", -1))
+            return -1 if socket == socket_bad else socket
         if c_value[0] == ffi.NULL:
             return b""
 
@@ -606,10 +612,12 @@ class Curl:
         self, clear_headers: bool = True, clear_resolve: bool = True
     ) -> None:
         """Clean up handles and buffers after ``perform`` and ``close``,
-        called at the end of ``perform`` and ``close``."""
+        called at the end of ``perform`` and ``close``. The debug callback is
+        kept: libcurl logs through it until the handle is reset or closed."""
+        if self._debug_handle is not None:
+            ffi.from_handle(self._debug_handle).exception = None
         self._write_handle = None
         self._header_handle = None
-        self._debug_handle = None
         self._body_handle = None
         self._read_handle = None
         self._seek_handle = None
@@ -649,7 +657,11 @@ class Curl:
         self._skip_cacert = False
         if self._curl is not None:
             lib.curl_easy_reset(self._curl)
+            # Before _set_error_buffer(), which installs a new one for debug=True.
+            self._debug_handle = None
             self._set_error_buffer()
+        else:
+            self._debug_handle = None
         self._resolve = ffi.NULL
 
     def parse_cookie_headers(self, headers: list[bytes]) -> SimpleCookie:
@@ -684,11 +696,11 @@ class Curl:
         m = STATUS_LINE_RE.match(status_line)
         if not m:
             return CurlHttpVersion.V1_0, 0, b""
-        if m.group(1) == "2.0":
+        if m.group(1) == b"2.0":
             http_version = CurlHttpVersion.V2_0
-        elif m.group(1) == "1.1":
+        elif m.group(1) == b"1.1":
             http_version = CurlHttpVersion.V1_1
-        elif m.group(1) == "1.0":
+        elif m.group(1) == b"1.0":
             http_version = CurlHttpVersion.V1_0
         else:
             http_version = CurlHttpVersion.NONE
@@ -699,11 +711,13 @@ class Curl:
 
     def close(self) -> None:
         """Close and cleanup curl handle, wrapper for ``curl_easy_cleanup``."""
-        self.clean_handles_and_buffers()
-
         if self._curl:
+            # Cleanup can still call the callbacks, e.g. to log closing the
+            # connections; their contexts are released afterwards.
             lib.curl_easy_cleanup(self._curl)
             self._curl = None
+        self.clean_handles_and_buffers()
+        self._debug_handle = None
         ffi.release(self._error_buffer)
 
         if self._ws_recv_buffer is not None:
@@ -722,6 +736,9 @@ class Curl:
         if self._curl is None:
             raise CurlError("Cannot receive websocket data on closed handle.")
 
+        if self._ws_recv_buffer is None:
+            self._ws_recv_buffer = ffi.new("char[]", self._WS_RECV_BUFFER_SIZE)
+
         if ret := lib.curl_ws_recv(
             self._curl,
             self._ws_recv_buffer,
@@ -738,7 +755,9 @@ class Curl:
         )
 
     def ws_send(
-        self, payload: bytes | memoryview, flags: CurlWsFlag | int = CurlWsFlag.BINARY
+        self,
+        payload: bytes | bytearray | memoryview,
+        flags: CurlWsFlag | int = CurlWsFlag.BINARY,
     ) -> int:
         """Send data to a websocket connection.
 
@@ -751,10 +770,15 @@ class Curl:
 
         Raises:
             CurlError: if failed.
+
+        Notes:
+            Memoryview payloads must be byte-format for ``len()`` to work correctly.
         """
         if self._curl is None:
             raise CurlError("Cannot send websocket data on closed handle.")
 
+        # Do NOT assign ffi.from_buffer() to a variable!
+        # See: https://github.com/lexiforest/curl_cffi/pull/700
         if ret := lib.curl_ws_send(
             self._curl,
             ffi.from_buffer(payload),

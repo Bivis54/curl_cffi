@@ -1,0 +1,125 @@
+websocket: report RSV1 as CURLWS_DEFLATE so callers can inflate permessage-deflate frames
+
+diff --git a/include/curl/websockets.h b/include/curl/websockets.h
+index bf93715..616dd99 100644
+--- a/include/curl/websockets.h
++++ b/include/curl/websockets.h
+@@ -58,6 +58,9 @@ CURL_EXTERN CURLcode curl_ws_recv(CURL *curl, void *buffer, size_t buflen,
+ 
+ /* flags for curl_ws_send() */
+ #define CURLWS_PONG       (1 << 6)
++/* permessage-deflate: RSV1 marks a compressed payload (RFC 7692). Reported
++   on receive only; libcurl does not compress outgoing frames. */
++#define CURLWS_DEFLATE    (1 << 7)
+ 
+ /*
+  * NAME curl_ws_send()
+diff --git a/lib/ws.c b/lib/ws.c
+index 60c2761..34faf37 100644
+--- a/lib/ws.c
++++ b/lib/ws.c
+@@ -383,6 +383,21 @@ static const char *ws_frame_name_of_op(uint8_t firstbyte)
+ static int ws_frame_firstbyte2flags(struct Curl_easy *data,
+                                     uint8_t firstbyte, int cont_flags)
+ {
++  int deflate_flag = 0;
++
++  /* RSV1 signals a permessage-deflate compressed payload (RFC 7692).
++     libcurl does not implement the extension itself; it only reports the
++     bit so the application can inflate the payload. */
++  if(firstbyte & WSBIT_RSV1) {
++    deflate_flag = CURLWS_DEFLATE;
++    firstbyte &= (uint8_t)~WSBIT_RSV1; /* clear it so the switch matches */
++  }
++
++  /* RSV2 and RSV3 remain invalid per RFC 6455 */
++  if(firstbyte & (WSBIT_RSV2 | WSBIT_RSV3)) {
++    failf(data, "[WS] invalid reserved bits: %02x", firstbyte);
++    return 0;
++  }
+   switch(firstbyte) {
+   /* 0x00 - intermediate TEXT/BINARY fragment */
+   case WSBIT_OPCODE_CONT:
+@@ -390,71 +405,67 @@ static int ws_frame_firstbyte2flags(struct Curl_easy *data,
+       failf(data, "[WS] no ongoing fragmented message to resume");
+       return 0;
+     }
+-    return cont_flags | CURLWS_CONT;
++    return (cont_flags | CURLWS_CONT) | deflate_flag;
+   /* 0x80 - final TEXT/BIN fragment */
+   case (WSBIT_OPCODE_CONT | WSBIT_FIN):
+     if(!(cont_flags & CURLWS_CONT)) {
+       failf(data, "[WS] no ongoing fragmented message to resume");
+       return 0;
+     }
+-    return cont_flags & ~CURLWS_CONT;
++    return (cont_flags & ~CURLWS_CONT) | deflate_flag;
+   /* 0x01 - first TEXT fragment */
+   case WSBIT_OPCODE_TEXT:
+     if(cont_flags & CURLWS_CONT) {
+       failf(data, "[WS] fragmented message interrupted by new TEXT msg");
+       return 0;
+     }
+-    return CURLWS_TEXT | CURLWS_CONT;
++    return (CURLWS_TEXT | CURLWS_CONT) | deflate_flag;
+   /* 0x81 - unfragmented TEXT msg */
+   case (WSBIT_OPCODE_TEXT | WSBIT_FIN):
+     if(cont_flags & CURLWS_CONT) {
+       failf(data, "[WS] fragmented message interrupted by new TEXT msg");
+       return 0;
+     }
+-    return CURLWS_TEXT;
++    return CURLWS_TEXT | deflate_flag;
+   /* 0x02 - first BINARY fragment */
+   case WSBIT_OPCODE_BIN:
+     if(cont_flags & CURLWS_CONT) {
+       failf(data, "[WS] fragmented message interrupted by new BINARY msg");
+       return 0;
+     }
+-    return CURLWS_BINARY | CURLWS_CONT;
++    return (CURLWS_BINARY | CURLWS_CONT) | deflate_flag;
+   /* 0x82 - unfragmented BINARY msg */
+   case (WSBIT_OPCODE_BIN | WSBIT_FIN):
+     if(cont_flags & CURLWS_CONT) {
+       failf(data, "[WS] fragmented message interrupted by new BINARY msg");
+       return 0;
+     }
+-    return CURLWS_BINARY;
++    return CURLWS_BINARY | deflate_flag;
+   /* 0x08 - first CLOSE fragment */
+   case WSBIT_OPCODE_CLOSE:
+     failf(data, "[WS] invalid fragmented CLOSE frame");
+     return 0;
+   /* 0x88 - unfragmented CLOSE */
+   case (WSBIT_OPCODE_CLOSE | WSBIT_FIN):
+-    return CURLWS_CLOSE;
++    return CURLWS_CLOSE | deflate_flag;
+   /* 0x09 - first PING fragment */
+   case WSBIT_OPCODE_PING:
+     failf(data, "[WS] invalid fragmented PING frame");
+     return 0;
+   /* 0x89 - unfragmented PING */
+   case (WSBIT_OPCODE_PING | WSBIT_FIN):
+-    return CURLWS_PING;
++    return CURLWS_PING | deflate_flag;
+   /* 0x0a - first PONG fragment */
+   case WSBIT_OPCODE_PONG:
+     failf(data, "[WS] invalid fragmented PONG frame");
+     return 0;
+   /* 0x8a - unfragmented PONG */
+   case (WSBIT_OPCODE_PONG | WSBIT_FIN):
+-    return CURLWS_PONG;
++    return CURLWS_PONG | deflate_flag;
+   /* invalid first byte */
+   default:
+-    if(firstbyte & WSBIT_RSV_MASK)
+-      /* any of the reserved bits 0x40/0x20/0x10 are set */
+-      failf(data, "[WS] invalid reserved bits: %02x", firstbyte);
+-    else
+-      /* any of the reserved opcodes 0x3-0x7 or 0xb-0xf is used */
+-      failf(data, "[WS] invalid opcode: %02x", firstbyte);
++    /* reserved bits are handled above; only bad opcodes reach here */
++    failf(data, "[WS] invalid opcode: %02x", firstbyte);
+     return 0;
+   }
+ }

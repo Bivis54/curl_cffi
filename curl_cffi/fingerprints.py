@@ -177,6 +177,14 @@ NATIVE_IMPERSONATE_TARGETS = [
     },
     {
         "browser": "Chrome",
+        "version": "152",
+        "os": "Windows",
+        "os_version": "10",
+        "target_name": "chrome152",
+        "h3_fingerprints": True,
+    },
+    {
+        "browser": "Chrome",
         "version": "99",
         "os": "Android",
         "os_version": "12",
@@ -387,10 +395,12 @@ class Fingerprint:
     tls_delegated_credentials: list[str] = field(default_factory=list)
     tls_record_size_limit: int | None = None
     tls_grease: bool = False
+    tls_grease_sigalgs: bool | None = None
     tls_use_new_alps_codepoint: bool = False
     tls_signed_cert_timestamps: bool = False
     tls_ech: str | None = None
     tls_permute_extensions: bool = False
+    tls_trust_anchors: list[str] | None = None
 
     headers: dict[str, str] = field(default_factory=dict)
     header_order: str = ""
@@ -412,6 +422,12 @@ class Fingerprint:
     http3_tls_supported_groups: list[str] = field(default_factory=list)
     quic_transport_parameters: str = ""
     quic_cid_length: str | None = None
+    quic_initial_packet_number: int | None = None
+    quic_max_udp_payload_size: int | None = None
+    quic_address_token: bool | None = None
+    http3_grease_frame: bool | None = None
+    http3_priority_update: bool | None = None
+    http3_earlydata: bool | None = None
 
     ws_headers: dict[str, str] = field(default_factory=dict)
     ws_header_order: str = ""

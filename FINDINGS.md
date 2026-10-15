@@ -1,0 +1,552 @@
+# FINDINGS: QUIC through SOCKS5, indistinguishable from Chrome
+
+This branch rebases the fork onto upstream curl_cffi **0.16.4b1**
+(curl-impersonate **2.2.3**, curl **8.22**, BoringSSL, ngtcp2 1.20, nghttp3
+1.15) and re-applies the fork's changes from scratch. One wheel now:
+
+1. sends HTTP/3 through authenticated SOCKS5 proxies with UDP ASSOCIATE for
+   `http_version="v3"` and `"v3only"`, with `socks5://` and `socks5h://`,
+   including relays that only serve one destination per association (soax),
+   relays that batch datagrams, and relays with odd BND.ADDR or reply headers;
+2. produces a QUIC/HTTP/3 fingerprint that a structural comparator cannot tell
+   apart from Chrome 152/155 on quic.browserleaks.com and fp.impersonate.pro,
+   first connection and 0-RTT resumption included;
+3. keeps the fork's WebSocket changes (`WebSocket._inflate`, own PONG in
+   `recv_fragment`, `CurlWsFlag.DEFLATE`) and the Chrome TCP fingerprint, now
+   with GREASE in `signature_algorithms` (peetprint matches);
+4. has no CLOSE_WAIT build-up (#837) and keeps WebSockets on TCP.
+
+Install (Linux x86_64, glibc >= 2.17, CPython >= 3.10):
+
+```
+pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+```
+
+The wheel reports `curl-impersonate/2.2.3-bivis.2` in
+`curl_cffi.__curl_version__`.
+
+## 1. Build path
+
+- curl_cffi links one static `libcurl-impersonate.a`. Upstream's
+  `scripts/build.py` downloads it prebuilt from lexiforest/curl-impersonate
+  releases unless `IMPERSONATE_BUILD_DIR` points at a local build.
+- The old fork downloaded `2.1.0-ws4` from Bivis54/curl-impersonate. Pushing
+  to that repository is denied for this work (HTTP 403), so the native patches
+  now live in this repository:
+  - `native/curl-impersonate.env` pins upstream curl-impersonate `v2.2.3` and
+    zig 0.15.2.
+  - `native/patches/<dependency>/*.patch` are appended to the matching
+    `patches/<dependency>.patch` of that release (curl, ngtcp2, nghttp3).
+  - `scripts/build_libcurl_impersonate.sh OUT` clones the release, applies the
+    patches and builds for `x86_64-linux-gnu.2.17` with zig (manylinux2014),
+    then merges everything into `OUT/libdir/libcurl-impersonate.a`.
+  - The `Makefile` applies `native/patches/curl/*.patch` when it preprocesses
+    the curl headers for the cffi bindings.
+- `.github/workflows/fork-wheel.yaml` builds the library (about 5 minutes,
+  cached on `native/**`), builds the cp310-abi3 manylinux2014 x86_64 wheel with
+  cibuildwheel (which also runs the unit suite), verifies the wheel on Ubuntu
+  24.04 (section 7) and publishes a pre-release for `chrome152-*` tags.
+- Only Linux x86_64 is built. Upstream's multi-platform jobs in
+  `build-and-test.yaml` link upstream's prebuilt library, which lacks these
+  patches, so they now only run in lexiforest/curl_cffi; lint and sdist still
+  run here. For the same reason `scripts/build.py` without
+  `IMPERSONATE_BUILD_DIR` builds against a library without the fork's
+  patches; build with `scripts/build_libcurl_impersonate.sh out` and
+  `IMPERSONATE_BUILD_DIR=out/libdir`.
+
+## 2. The old fork's changes and where they went
+
+| Change in chrome152-2 / its curl-impersonate | Status on 0.16.4b1 |
+| --- | --- |
+| (a) `WebSocket._inflate`, `CurlWsFlag.DEFLATE` (RSV1 reported to Python) | Re-applied: `native/patches/curl/0001`, `curl_cffi/requests/websockets.py` |
+| (b) Own PONG in `recv_fragment` | Re-applied and extended (below) |
+| (c) chrome152 target with trust anchor IDs (`trust-anchors.patch`) | 2.2.3 already has the `CURLOPT_TLS_TRUST_ANCHORS` machinery; only the chrome152 entry is carried (`0005`) |
+| (c) `chrome152` in `impersonate.py` | Re-applied; `chrome` now resolves to `chrome152` |
+| (d) `build.py` pointing at `2.1.0-ws4`, `bin/curl_chrome152`, `win/build.bat` | Replaced by the in-repo native build; the CLI wrapper is not needed by curl_cffi |
+
+The brief says upstream 0.16.3 ships a chrome152 target; it does not. The
+newest native target in curl-impersonate 2.2.3 is `chrome150`, so the fork
+keeps its own chrome152 entry.
+
+Own PONG: since curl 8.21 the automatic PONG is queued in `ws->pending` and
+only flushed by the next send, so a connection that only receives pings never
+answers them and the server closes it at its ping timeout. The fork sets
+`CURLWS_NOAUTOPONG` on every WebSocket handle and replies itself in `recv`,
+`recv_fragment`, `run_forever` and the async reader (RFC 6455 5.5.3: the PONG
+echoes the PING payload).
+
+## 3. HTTP/3 through SOCKS5 UDP ASSOCIATE
+
+curl 8.22 already contains the fixes for #842/#843 (UDP ASSOCIATE decided at
+connect time) and #743 (`v3` with a proxy). Real relays needed more:
+
+| Problem found | Effect before | Fix |
+| --- | --- | --- |
+| Relay sends several complete SOCKS datagrams (each with its own header) in one UDP datagram; seen on 24.144.88.46 | upstream reads the first QUIC packet, drops the rest; HTTP/3 stalls or times out on most sites | `0002`: split batches, one datagram per read |
+| BND.ADDR `0.0.0.0`, private, CGNAT or loopback from a public proxy | datagrams sent to an unusable address | `0002`: fall back to the proxy's address |
+| Reply headers with a zero or domain source address | upstream took the QUIC peer from each reply header; with `socks5://` a zeroed source no longer matched the path and ngtcp2 dropped the packets | `0002`: the QUIC peer never changes after setup |
+| Local HTTPS-RR (DNS) lookups for the origin while using a proxy | DNS leak, and ECH configs Chrome behind a proxy never has (changes the resumed JA4) | `0003`: no HTTPS-RR query when a proxy resolves the origin |
+| `socks5://` sends the IPv6 address of dual-stack names (curl 8.22 prefers IPv6, the proxy cannot fall back) | www.facebook.com through an IPv4-only relay: error 7 over QUIC, 97 over TCP | `0007`: prefer IPv4 unless `CURLOPT_IPRESOLVE` asks for IPv6 |
+
+### Single-destination relays (soax) and why routers work
+
+soax support says one association reliably serves only one destination. The
+owner's probe sends DNS queries through an association, then reuses it, and
+the second run fails with `dns rcode 2`. curl's design avoids every part of
+that, verified with the local proxy's `--single-target` mode, which drops and
+counts datagrams to a second destination:
+
+- One UDP association per QUIC connection, opened by the connection and
+  closed with it. A new connection, including a resumption, opens a new
+  association (`test_one_association_per_connection`: 3 connections, 3
+  associations).
+- One destination per association, always written the same way: the host
+  name for `socks5h://`, the resolved IP for `socks5://`. Two origins get two
+  associations (`test_two_origins_two_associations`).
+- Nothing but QUIC packets to that destination: no DNS or probes through the
+  relay (every association logs `dns: 0`, `violations: 0`).
+- The UDP ASSOCIATE request carries `0.0.0.0:0`, which relays accept when the
+  client is behind NAT.
+
+Routers that "just work" with soax (tun2socks, sing-box, Clash and similar)
+do the same thing: one association per UDP flow (source and destination),
+DNS resolved separately, never mixing destinations, so they never hit the
+restriction. The real soax and proxyshard accounts are tested with
+`scripts/test_real_proxies.py` (section 8), which the owner runs with the
+credentials.
+
+### `v3` races TCP behind a proxy
+
+With `http_version="v3"` curl starts a TCP attempt when the QUIC attempt has
+seen no data after 100 ms (`CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS / 2`), and
+always after 200 ms. Behind a remote proxy the SOCKS handshake alone takes
+longer, so the proxy normally sees a TCP CONNECT next to the UDP ASSOCIATE
+(verified by chaining the logging proxy in front of 206.189.95.199). QUIC
+normally wins; in 30 sessions through 206.189.95.199 one first request was
+won by TCP after a lost UDP packet. This is curl's design, close to Chrome,
+which also races TCP on connections where QUIC is not yet known to work.
+Use `v3only` for UDP only, or a larger `HAPPY_EYEBALLS_TIMEOUT_MS`.
+
+## 4. QUIC fingerprint parity
+
+Reference: Chrome for Testing 152.0.7977.82 and Chrome 155.0.8059.39 captured
+in CI (`.github/workflows/quic-bench.yaml`, `tests/groundtruth/`); Chrome
+152, 154 and 155 produce the same QUIC fingerprint when ECH is GREASE.
+
+| Field | Chrome | upstream 0.16.4b1 | chrome152-2 | this branch |
+| --- | --- | --- | --- | --- |
+| JA4, first | `q13d0312h3_55b375c5d22e_178839b6cec1` | `q13d0311h3_…_653d80c3fe9d` | same as Chrome | same as Chrome |
+| JA4, resumed | `q13d0314h3_55b375c5d22e_79cc91d6b50c` | `q13d0311h3_…` (no resumption) | `q13d0313h3_…_b0954bf1abdf` | same as Chrome |
+| `h3_hash` | `ba909fc3dc419ea5c5b26c6323ac1879` | `e1d11ee6…` | `e1d11ee6…` | same as Chrome |
+| Extension order | permuted, PSK last | permuted | sorted | permuted per connection, PSK last |
+| Initial packets | 2 x 1250 B, PN 1, 2 | 2 x 1200 B, PN 1, 2 | 2 x 1200 B, PN 0, 1 | 2 x 1250 B, PN 1, 2 |
+| HTTP/3 frames | SETTINGS, GREASE, PRIORITY_UPDATE, HEADERS | SETTINGS, HEADERS | SETTINGS, HEADERS | as Chrome |
+| `initial_rtt` TP | resumed only | none | none | resumed only |
+| 0-RTT, early_data, token | yes | no | no | yes |
+| TCP JA4 | `t13d1517h2_8daaf6152771_cb7bf5808d99` | `t13d1516h2_…_806a8c22fdea` | same as Chrome | same as Chrome |
+| TCP peetprint | `fc97c1cdfb1409c9a9326c1b726d1dee` | `67c3e911…` | `1528e8ef…` | same as Chrome |
+
+Levers (`native/patches/`):
+
+- **Extension permutation**: BoringSSL's permutation on the QUIC handshake
+  (`http3_ssl_permute_extensions`) with Chrome's HTTP/3 extension set; PSK
+  stays last and the order changes with every connection.
+- **Initial size 1250**: `CURLOPT_QUIC_MAX_UDP_PAYLOAD_SIZE` sets ngtcp2's
+  `max_tx_udp_payload_size`, without payload shaping or PMTUD.
+- **First packet number 1**: 2.2.3's `quic_initial_packet_number`.
+- **ClientHello split**: Chrome's resumed ClientHello fits in two Initials;
+  ngtcp2's Initial "crumbling" needed three in 4 of 5 attempts. The ngtcp2
+  patch packs CRYPTO data densely, splits the SNI inside a packet and fills
+  gaps with PING frames only, so the rest can be padding or coalesced 0-RTT.
+- **HTTP/3 GREASE frame**: new `nghttp3_conn_submit_grease_frame()` (nghttp3
+  patch), sent on the control stream after SETTINGS, type `0x1f * N + 0x21`
+  with `N % 4` bytes like Chromium.
+- **PRIORITY_UPDATE**: sent for the request stream unless the priority is the
+  default `u=3`, giving Chrome's `984832` (`0xF0700`) frame.
+- **`initial_rtt`** (TP 0x3127): the `12583:CACHED` keyword sends the smoothed
+  RTT remembered from the previous connection to the host, and nothing on a
+  first connection, as Chrome does.
+- **0-RTT, early_data, address token**: BoringSSL early data for QUIC on
+  resumption (GET/HEAD only), 0-RTT transport parameters, `NEW_TOKEN` tokens
+  kept per peer in the session cache and replayed. A server rejecting 0-RTT
+  makes curl re-send the request after the handshake (tested).
+- **0-RTT packet layout** (`0008`): with early data curl wrote nothing until
+  the request was added, so whenever the ClientHello filled the second Initial
+  datagram, SETTINGS, GREASE, PRIORITY_UPDATE and HEADERS shared one 0-RTT
+  packet. quic.browserleaks.com reads the streams concurrently and reported
+  only SETTINGS and HEADERS for 2 of 20 resumed connections (`h3_hash`
+  mismatch). Chrome sends the control stream in its first flight and the
+  request in a later packet (seen in a decrypted local capture); curl now does
+  the same, and 100 of 100 resumed connections were correct afterwards.
+- **Transport parameter details**: GREASE TP with 0-15 random bytes and a
+  random GREASE position in `version_information`, both like Chromium.
+- **TCP**: `CURLOPT_TLS_GREASE_SIGALGS` (BoringSSL
+  `SSL_CTX_set_grease_sigalgs_enabled`, Chromium `kTlsGreaseSigalgs`), only
+  over TCP like Chrome.
+- **Trust anchor IDs** (`0006`): chrome152 advertises Chrome's 28 trust
+  anchor IDs, 15 of which belong to intermediates (Google WR1-4, WE1-4, AE1;
+  Let's Encrypt E7-9, R12-14) that Chrome's root store treats as trust
+  anchors. Google then sends only the leaf over QUIC, and verification against
+  a roots-only CA bundle failed with curl error 60. Transfers advertising
+  these IDs now load the matching certificates
+  (`scripts/gen_trust_anchor_certs.py` regenerates them from Chromium).
+
+Structural comparator (`tests/quic_bench/fingerprint_diff.py`) against
+`tests/groundtruth/chrome155.json` (the same with `chrome152.json`): **0
+failed checks** for this branch, **23** for chrome152-2, **25** for upstream
+0.16.4b1. Like Chrome, curl uses real ECH when DNS has HTTPS records for the
+site, which is the case on direct connections; behind a proxy neither has
+them and both use GREASE ECH. CI therefore compares a direct capture with
+`chrome154_dns_ech.json` and a capture through a local SOCKS5 proxy with the
+Chrome 155 and 152 captures; both show 0 failed checks.
+
+### Chrome details found while measuring
+
+- `initial_rtt` only appears when Chrome has an RTT for the host, so never on
+  a first connection.
+- Chrome replays the server's address token only sometimes: 4 of 11 resumed
+  captures, and the same Chrome for Testing 152 build did it in two runs and
+  not in a third. quiche's `QuicClientSessionCache::OnNewTokenReceived` drops a
+  token that arrives before the session entry exists, and
+  `TlsClientHandshaker::InsertSession` only creates the entry after the
+  server's HTTP/3 SETTINGS, so it is a race. The fork always keeps the token
+  (the case the brief asks for); the references used have it.
+- With DNS HTTPS records Chrome uses real ECH and the resumed JA4 becomes
+  `q13d0313h3_…_27b11b7e031e` (`chrome154_dns_ech.json`). Behind a proxy
+  Chrome has no HTTPS records and uses GREASE ECH, which is what the fork
+  does and why `0003` stops local HTTPS-RR lookups behind proxies.
+- Chrome's first load of fp.impersonate.pro is HTTP/2; the capture retries
+  until HTTP/3.
+
+## 5. Preserved behaviour and regressions
+
+| Check | Before | After |
+| --- | --- | --- |
+| Markers: `WebSocket._inflate`, PONG in `recv_fragment`, `CurlWsFlag.DEFLATE == 128` | missing on upstream | present |
+| `tests/unittest/test_websockets_fork.py` (inflate with context takeover and fragments; PONG from 4 readers) | upstream 0.16.4b1: 8 of 8 fail | 8 pass |
+| Idle wss, server pings every 20 s with a 10 s timeout, 70 s | upstream 0.16.4b1: `recv`, `run_forever` and async reader all dropped at 30 s | all alive at 70 s |
+| CLOSE_WAIT through a SOCKS proxy, TLS peer without close_notify, 6 x 100 requests (#837) | 0.16.0: 22, 32, 41, 53, 65, 77 (0.16.4b1: all 0) | 0, 0, 0, 0, 0, 0 |
+| WebSocket with `http_version` v3/v3only through SOCKS5 | TCP (curl bootstraps WebSockets over HTTP/1.1 only) | only CONNECT, no UDP ASSOCIATE |
+| Local SOCKS5 relay matrix (`tests/integration/test_socks5_udp.py`, 34 cases) | chrome152-2: 0 pass; upstream 0.16.4b1: 25 pass | 34 pass |
+
+Also fixed while building the diagnostics (chrome152-4): curl_cffi's
+low-level `Curl` released its debug callback context after `perform()` and
+before `curl_easy_cleanup()`, while libcurl kept the pointer. With
+`VERBOSE` and a `DEBUGFUNCTION`, a second `perform()` or `close()` called
+into freed memory: the interpreter aborted, or another callback ran in its
+place. The requests API resets the handle between requests and was not
+affected. `tests/unittest/test_curl.py::test_debug_function_after_perform`
+covers it.
+
+## 6. Known issues
+
+- **Google and YouTube over QUIC through the maintainer's test relays** often
+  end in handshake timeouts for every client: upstream 0.16.4b1 failed 12 of
+  12 attempts through 206.189.95.199, this branch 14 of 16. In the failing
+  attempts the relay returns a single datagram from Google. Other QUIC sites work
+  through the same relays, and Google works from CI with direct UDP
+  (`test_google_http3_certificate_verifies`).
+- **First request timing.** On new connections curl sends the request in the
+  same burst as its handshake Finished, about 0.06 ms after the packet with
+  the control stream; Chrome's request followed about 2 ms later in a local
+  capture (the packet layout is otherwise the same). quic.browserleaks.com
+  reads the control and request streams concurrently, so for 3 of 60 new
+  connections it reported GREASE or PRIORITY_UPDATE missing and a different
+  `h3_hash`. The spacing is visible on the wire. CI captures once more
+  before failing the Chrome comparison.
+- **QPACK differs from Chrome, visible to the server only** (decrypted local
+  captures). Chrome opens its QPACK encoder stream with the first request,
+  inserts most headers into the dynamic table (about 400 bytes of encoder
+  instructions, a 20-byte HEADERS frame) and uses remembered server SETTINGS
+  for 0-RTT. nghttp3 opens the control, encoder and decoder streams together,
+  sends a 190-byte HEADERS frame on new connections and only literal headers
+  (430 bytes) in 0-RTT. quic.browserleaks.com and fp.impersonate.pro do not
+  report this; matching it needs a different encoder strategy in nghttp3.
+- `Curl.getinfo(CurlInfo.CERTINFO)` crashes: curl_cffi treats the
+  `struct curl_certinfo *` result as a `curl_slist` and frees curl's memory.
+  This is upstream curl_cffi code, unchanged here.
+- Only Linux x86_64 wheels are built (section 1).
+- Real soax and proxyshard results come from `scripts/test_real_proxies.py`
+  runs on the owner's machine (section 8); CI cannot hold the credentials.
+
+## 7. Test bench
+
+- `tests/integration/test_socks5_udp.py`: HTTP/3 through the local proxy in
+  every scheme x version x relay mode (plain, single target, batching,
+  unspecified BND.ADDR, zero and domain reply sources, mandatory auth), one
+  association per connection and origin, 0-RTT and 0-RTT rejection through
+  the proxy, IPv4 preference, and real proxies from `SOCKS5_UDP_PROXIES`.
+- `tests/integration/test_websocket_idle.py` (`RUN_SLOW_TESTS=1`),
+  `test_close_wait.py`, `test_websocket_transport.py`,
+  `test_http3_early_data.py` (0-RTT request after the control streams),
+  `tests/unittest/test_websockets_fork.py`.
+- `tests/integration/test_quic_fingerprint.py` (`RUN_LIVE_TESTS=1`, optional
+  `FINGERPRINT_PROXY`): live capture diffed against the Chrome references,
+  and Google over HTTP/3 with certificate verification.
+- `tests/quic_bench/`: `capture_chrome.py` (Playwright, Chrome for Testing),
+  `capture_curl_cffi.py`, `fingerprint_diff.py`, `h3_server.py` (aioquic) and
+  `socks5_udp.py` (CONNECT and UDP ASSOCIATE with the relay modes above,
+  chaining to an upstream proxy, JSON log per association).
+
+With an installed wheel, run them from a copy of `tests/` (and `assets/`)
+outside the source tree, as `fork-wheel.yaml` does, so that the source
+package does not shadow the wheel:
+
+```
+python tests/quic_bench/capture_curl_cffi.py --out snap --proxy socks5h://user:pass@host:port
+python tests/quic_bench/fingerprint_diff.py tests/groundtruth/chrome155.json snap/curl_cffi.json
+SOCKS5_UDP_PROXIES=socks5h://user:pass@host:port RUN_SLOW_TESTS=1 python -m pytest tests/integration
+```
+
+## 8. Testing real providers
+
+`scripts/test_real_proxies.py` needs only the installed wheel (no checkout,
+no test dependencies) and reads the proxies from `PROXYSHARD_SOCKS5_URL` and
+`SOAX_SOCKS5_URL` (`socks5h://user:pass@host:port`). It never prints them:
+errors are scrubbed of the URL, the credentials and the proxy host, the JSON
+file contains no URLs, and exit addresses are hidden unless `--show-ips` is
+given.
+
+On Ubuntu (Python 3.10 or newer; `sudo apt install python3-venv` first):
+
+```
+python3 -m venv ~/h3test && . ~/h3test/bin/activate
+pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+curl -LO https://raw.githubusercontent.com/Bivis54/curl_cffi/cursor/quic-socks5-chrome-parity-ef8a/scripts/test_real_proxies.py
+read -rsp "proxyshard URL: " PROXYSHARD_SOCKS5_URL && export PROXYSHARD_SOCKS5_URL; echo
+read -rsp "soax URL: " SOAX_SOCKS5_URL && export SOAX_SOCKS5_URL; echo
+python test_real_proxies.py --json results.json
+```
+
+`read -s` keeps the URLs off the screen and out of the shell history. A
+provider whose variable is unset is skipped; `--providers soax` runs one.
+
+Per provider, 26 requests by default (about a minute):
+
+| Test | Requests |
+| --- | --- |
+| matrix | Cloudflare's trace endpoint through `socks5h://` and `socks5://` with `v3only` and `v3` |
+| sequential | 3 rounds over cloudflare-quic.com, www.google.com, quic.browserleaks.com and fp.impersonate.pro |
+| concurrent | 2 requests per host at once |
+| fingerprint | a fresh and a resumed connection on quic.browserleaks.com, compared with Chrome 152 |
+
+Every request uses a new QUIC connection and therefore a new UDP association,
+so single-target relays are exercised the way curl uses them; later
+sequential requests to a host resume with 0-RTT. In the matrix, `v3` gets a
+5 s happy-eyeballs window so that one lost UDP packet does not hand the race
+to TCP. A request passes when it completed over HTTP/3. The Cloudflare rows
+also need Cloudflare to report `http=http/3` from an address other than this
+machine's, which is looked up directly over TCP at the start; otherwise the
+proxy was bypassed. The script prints progress marks, a table with protocol,
+status, time and details per request, a summary per provider and host, and
+the scrubbed errors. Exit status: 0 when nothing failed, 1 when a check
+failed, 2 when no provider is configured, 3 when the script itself failed.
+
+Reading failures:
+
+- `curl: (55) ... ERR_HANDSHAKE_TIMEOUT` or `curl: (28) ... 0 bytes
+  received`: no QUIC handshake through the relay. `--direct` repeats the
+  requests without a proxy; if they pass there, the provider's UDP path loses
+  packets to that host. Google through the maintainer's test relays fails
+  this way for every client (section 6).
+- `curl: (97)`: the proxy rejected the SOCKS5 handshake, the credentials or
+  UDP ASSOCIATE. `curl: (7)`: the proxy is unreachable.
+- `completed over h2` or `Cloudflare received http/2`: the request did not
+  use QUIC, which `v3only` should never allow.
+- `exit address is this machine's: proxy bypassed`: QUIC went around the
+  proxy.
+- `JA4 ..., Chrome ...` is a real fingerprint difference. A `WARN` row with
+  an HTTP/3 text is the quic.browserleaks.com race from section 6; re-run.
+- `no 0-RTT on resumption`: the relay dropped the 0-RTT packets or the
+  server rejected early data.
+
+Other options: `--rounds`, `--concurrency`, `--timeout`, `--json FILE`,
+`--show-ips`, `--direct`, and `--no-exit-ip-check` for local test proxies,
+which exit from the same machine. CI runs the script against two local
+proxies, one in single-target mode with authentication, to keep it working.
+
+## 9. Test protocol for the owner's server
+
+For a server like the owner's (Ubuntu 24.04, x86_64, Python 3.12). Run it in
+bash. The first block is only needed when the proxy URLs are not exported yet:
+it reads them without echoing them or putting them in the shell history.
+
+```bash
+read -rsp "PROXYSHARD_SOCKS5_URL: " PROXYSHARD_SOCKS5_URL; echo; export PROXYSHARD_SOCKS5_URL
+read -rsp "SOAX_SOCKS5_URL: " SOAX_SOCKS5_URL; echo; export SOAX_SOCKS5_URL
+```
+
+Then paste this block unchanged. It works in `~/h3-protocol`, runs in a child
+shell (a failure cannot close the terminal), pins the test tools to commit
+`ceae661` and installs the chrome152-4 wheel with one pip command:
+
+```bash
+mkdir -p ~/h3-protocol && bash <<'PROTOCOL' 2>&1 | tee ~/h3-protocol/protocol.log
+set -u
+export PYTHONUNBUFFERED=1
+REV=ceae6615e433e28196269f34f62d3ee9c73d0a7e
+WHEEL=https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+RAW="https://raw.githubusercontent.com/Bivis54/curl_cffi/$REV"
+W="$HOME/h3-protocol"
+cd "$W" || exit 1
+rm -rf venv tools groundtruth traces fp results.txt ./*.json
+mkdir -p tools groundtruth fp traces
+step() { printf '\n==================== %s  [%s] ====================\n' "$*" "$(date -u +%T)"; }
+record() { printf 'RESULT %-28s %s\n' "$1" "$2"; printf '%-28s %s\n' "$1" "$2" >> "$W/results.txt"; }
+verdict() { if [ "$1" = 0 ]; then echo PASS; else echo "FAIL (exit $1)"; fi; }
+PROVIDERS="proxyshard:PROXYSHARD_SOCKS5_URL soax:SOAX_SOCKS5_URL"
+
+step "0 environment"
+date -u +%Y-%m-%dT%H:%M:%SZ; uname -srm; (. /etc/os-release && echo "$PRETTY_NAME")
+python3 --version; echo "cpus $(nproc)"; free -m | sed -n 2p
+ip -br addr 2>/dev/null; ip route get 1.1.1.1 2>/dev/null | head -1
+echo "ipv6 default route: $(ip -6 route show default 2>/dev/null | head -1)"
+ip -o link 2>/dev/null | awk '{print "link", $2, $4, $5}'
+echo "ntp synchronized: $(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+for p in $PROVIDERS; do
+  v=${p#*:}
+  if [ -n "${!v:-}" ]; then echo "$v: set, scheme ${!v%%://*}"; else echo "$v: NOT SET"; fi
+done
+
+step "1 fresh venv"
+if python3 -m venv venv >/dev/null 2>&1; then
+  record venv PASS
+else
+  rm -rf venv
+  echo "python3 -m venv needs python3.12-venv; using --without-pip and get-pip.py"
+  if python3 -m venv --without-pip venv && curl -fsSL https://bootstrap.pypa.io/get-pip.py | venv/bin/python - -q; then
+    record venv "PASS (pip bootstrapped)"
+  else
+    record venv FAIL; exit 1
+  fi
+fi
+. venv/bin/activate
+
+step "2 install the wheel from the GitHub release"
+if pip install --no-cache-dir --disable-pip-version-check --progress-bar off "$WHEEL"; then record install PASS; else record install FAIL; exit 1; fi
+echo "criteria: curl-impersonate/2.2.3-bivis.N build and the three patched-build markers"
+python - <<'EOF'
+import inspect
+import sys
+
+import curl_cffi
+from curl_cffi import CurlWsFlag
+from curl_cffi.requests.websockets import WebSocket
+
+print(curl_cffi.__version__, curl_cffi.__curl_version__)
+checks = {
+    "fork build (curl-impersonate/2.2.3-bivis)": "-bivis" in curl_cffi.__curl_version__,
+    "CurlWsFlag.DEFLATE == 128": int(CurlWsFlag.DEFLATE) == 128,
+    "WebSocket._inflate": callable(getattr(WebSocket, "_inflate", None)),
+    "own PONG in recv_fragment": "CurlWsFlag.PONG" in inspect.getsource(WebSocket.recv_fragment),
+}
+for name, ok in checks.items():
+    print("PASS" if ok else "FAIL", name)
+sys.exit(0 if all(checks.values()) else 1)
+EOF
+record markers "$(verdict $?)"
+
+step "3 download the test tools (pinned to $REV)"
+ok=0
+for f in scripts/test_real_proxies.py scripts/diagnose_real_proxies.py \
+         tests/quic_bench/capture_curl_cffi.py tests/quic_bench/fingerprint_diff.py \
+         tests/groundtruth/chrome155.json tests/groundtruth/chrome154_dns_ech.json; do
+  case $f in *.json) dir=groundtruth;; *) dir=tools;; esac
+  curl -fsSL -o "$dir/${f##*/}" "$RAW/$f" || { echo "download failed: $f"; ok=1; }
+done
+record download "$(verdict $ok)"; [ $ok = 0 ] || exit 1
+
+step "4 verbose diagnostics (curl SOCKS5, QUIC, UDP, TLS traces)"
+echo "criteria: printed per probe; RESULT lines below. The direct baseline needs UDP egress"
+echo "from this machine and only tells relay problems from client problems."
+python tools/diagnose_real_proxies.py --direct --providers "" --trace-dir traces --json diagnose-direct.json
+record "diagnostics direct" "$(verdict $?)"
+for p in $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  [ -n "${!v:-}" ] || { record "diagnostics $name" "SKIP ($v not set)"; continue; }
+  python tools/diagnose_real_proxies.py --providers "$name" --trace-dir traces --json "diagnose-$name.json"
+  record "diagnostics $name" "$(verdict $?)"
+done
+
+step "5 real-proxy matrix (socks5h/socks5 x v3only/v3, sequential, concurrent, fingerprint)"
+echo "criteria: every request completes over HTTP/3 (proto h3); Cloudflare reports"
+echo "http=http/3 from an exit address other than this machine's; JA4 = Chrome (else FAIL);"
+echo "HTTP/3 hash = Chrome (else WARN, a quic.browserleaks.com race; re-run)."
+python tools/test_real_proxies.py --direct --providers "" --rounds 1 --concurrency 1 --json real-direct.json
+record "matrix direct" "$(verdict $?)"
+for p in $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  [ -n "${!v:-}" ] || { record "matrix $name" "SKIP ($v not set)"; continue; }
+  python tools/test_real_proxies.py --providers "$name" --json "real-$name.json"
+  record "matrix $name" "$(verdict $?)"
+done
+
+step "6 QUIC/TLS fingerprint vs Chrome (structural comparator)"
+echo "criteria: 0 failed checks against Chrome 155 (GREASE ECH, as through proxies) or,"
+echo "when the capture used real ECH (direct, ECH configs from DNS), Chrome 154 with DNS ECH."
+for p in direct:- $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  if [ "$v" = - ]; then opt=(); else
+    [ -n "${!v:-}" ] || { record "fingerprint $name" "SKIP ($v not set)"; continue; }
+    opt=(--proxy-env "$v")
+  fi
+  python tools/capture_curl_cffi.py --out fp --label "$name" "${opt[@]}"
+  python tools/fingerprint_diff.py groundtruth/chrome155.json "fp/$name.json" \
+    --ech-reference groundtruth/chrome154_dns_ech.json
+  record "fingerprint $name" "$(verdict $?)"
+done
+
+step "7 summary"
+python - <<'EOF'
+import glob
+import json
+from collections import Counter
+
+for path in sorted(glob.glob("diagnose-*.json")):
+    for p in json.load(open(path)):
+        if p["result"] != "PASS":
+            print(f"FAIL  diagnostics {p['provider']}/{p['name']}: {p['errors'][0][:150]}")
+for path in sorted(glob.glob("real-*.json")):
+    checks = json.load(open(path))["checks"]
+    counts = Counter((c["provider"], c["result"]) for c in checks)
+    for provider in sorted({c["provider"] for c in checks}):
+        hosts = Counter()
+        for c in checks:
+            if c["provider"] == provider and c["result"] == "FAIL":
+                hosts[c["target"]] += 1
+        print(
+            f"matrix {provider}: {counts[(provider, 'PASS')]} PASS, "
+            f"{counts[(provider, 'WARN')]} WARN, {counts[(provider, 'FAIL')]} FAIL"
+            + (f" (failed by host: {dict(hosts)})" if hosts else "")
+        )
+EOF
+cat results.txt
+PROTOCOL
+(cd ~/h3-protocol && tar -czf report.tar.gz protocol.log results.txt traces fp ./*.json) && echo "report: ~/h3-protocol/report.tar.gz"
+```
+
+| Step | Checks | PASS when |
+| --- | --- | --- |
+| 0 | OS, Python, interfaces and MTU, IPv6 route, NTP, which variables are set | informational |
+| 1 | fresh venv | created; without python3.12-venv, pip is bootstrapped with get-pip.py |
+| 2 | one `pip install` of the release wheel, patched-build markers | fork build, `CurlWsFlag.DEFLATE`, `WebSocket._inflate`, PONG in `recv_fragment` |
+| 3 | download the tools | every file downloaded |
+| 4 | `diagnose_real_proxies.py`: direct baseline, then each provider | every probe meets the criteria it prints (TCP through the proxy, HTTP/3 through `socks5h://` and `socks5://` with the UDP relay in the trace, 0-RTT resumption, Google) |
+| 5 | `test_real_proxies.py`: direct baseline, then each provider | every request over HTTP/3; Cloudflare saw HTTP/3 from an address other than the server's; JA4 = Chrome |
+| 6 | fingerprint capture and structural comparator | 0 failed checks against Chrome |
+| 7 | summary | lists every failed check with its reason |
+
+The output goes to the terminal and `~/h3-protocol/protocol.log`;
+`~/h3-protocol/report.tar.gz` adds the full curl traces, the JSON results
+and the fingerprint snapshots. None of it contains the proxy URLs,
+credentials, hosts or addresses, or the exit addresses. The direct baseline
+needs UDP egress from the server; it only separates relay problems from
+client problems. The run takes about 10 minutes, longer when Google or the
+direct baseline time out.
+
+Upstream issues:
+[#842](https://github.com/lexiforest/curl_cffi/issues/842) and
+[#843](https://github.com/lexiforest/curl_cffi/issues/843) (SOCKS5 UDP
+regression), [#743](https://github.com/lexiforest/curl_cffi/issues/743)
+(`v3` with a proxy), [#837](https://github.com/lexiforest/curl_cffi/issues/837)
+(CLOSE_WAIT).

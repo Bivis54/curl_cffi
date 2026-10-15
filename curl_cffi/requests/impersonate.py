@@ -28,6 +28,7 @@ BrowserTypeLiteral = Literal[
     "chrome145",
     "chrome146",
     "chrome150",
+    "chrome152",
     "chrome99_android",
     "chrome131_android",
     # Safari
@@ -78,7 +79,7 @@ BrowserTypeLiteral = Literal[
 ]
 
 
-DEFAULT_CHROME = "chrome150"
+DEFAULT_CHROME = "chrome152"
 DEFAULT_EDGE = "edge101"
 DEFAULT_SAFARI = "safari2601"
 DEFAULT_SAFARI_IOS = "safari260_ios"
@@ -90,7 +91,7 @@ DEFAULT_TOR = "tor145"
 
 
 REAL_TARGET_MAP = {
-    "chrome": "chrome150",
+    "chrome": "chrome152",
     "edge": "edge101",
     "safari": "safari2601",
     "safari_ios": "safari260_ios",
@@ -146,6 +147,7 @@ class BrowserType(str, Enum):  # TODO: remove in version 1.x
     chrome145 = "chrome145"
     chrome146 = "chrome146"
     chrome150 = "chrome150"
+    chrome152 = "chrome152"
     chrome99_android = "chrome99_android"
     chrome131_android = "chrome131_android"
     safari153 = "safari153"
@@ -191,6 +193,13 @@ class ExtraFingerprints:
     form_boundary: Optional[bool] = None
     http3_sig_hash_algs: Optional[str] = None
     http3_tls_extension_order: Optional[str] = None
+    quic_initial_packet_number: Optional[int] = None
+    quic_max_udp_payload_size: Optional[int] = None
+    quic_address_token: Optional[bool] = None
+    http3_grease_frame: Optional[bool] = None
+    http3_priority_update: Optional[bool] = None
+    http3_earlydata: Optional[bool] = None
+    tls_grease_sigalgs: Optional[bool] = None
 
 
 class ExtraFpDict(TypedDict, total=False):
@@ -209,6 +218,13 @@ class ExtraFpDict(TypedDict, total=False):
     form_boundary: Optional[bool]
     http3_sig_hash_algs: Optional[str]
     http3_tls_extension_order: Optional[str]
+    quic_initial_packet_number: Optional[int]
+    quic_max_udp_payload_size: Optional[int]
+    quic_address_token: Optional[bool]
+    http3_grease_frame: Optional[bool]
+    http3_priority_update: Optional[bool]
+    http3_earlydata: Optional[bool]
+    tls_grease_sigalgs: Optional[bool]
 
 
 # TLS version are in the format of 0xAABB, where AA is major version and BB is minor

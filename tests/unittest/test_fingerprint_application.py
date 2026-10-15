@@ -1,3 +1,5 @@
+import pytest
+
 from curl_cffi.const import CurlOpt
 from curl_cffi.fingerprints import Fingerprint
 from curl_cffi.requests.impersonate import ExtraFingerprints
@@ -11,6 +13,23 @@ class FakeCurl:
 
     def setopt(self, option, value):
         self.options[option] = value
+
+
+@pytest.mark.parametrize("packet_number", [None, -1, 0, 1, 2147483647])
+def test_apply_fingerprint_quic_initial_packet_number(packet_number):
+    curl = FakeCurl()
+
+    _apply_fingerprint(
+        curl,
+        Fingerprint(quic_initial_packet_number=packet_number),
+        existing_header_names=set(),
+        default_headers=False,
+    )
+
+    if packet_number is None:
+        assert CurlOpt.QUIC_INITIAL_PACKET_NUMBER not in curl.options
+    else:
+        assert curl.options[CurlOpt.QUIC_INITIAL_PACKET_NUMBER] == packet_number
 
 
 def test_apply_fingerprint_does_not_select_http_version():
@@ -87,6 +106,33 @@ def test_apply_fingerprint_with_tls_extension_order_respects_cert_compression():
     )
 
     assert curl.options[CurlOpt.SSL_CERT_COMPRESSION] == "zlib"
+
+
+def test_apply_fingerprint_sets_tls_trust_anchors():
+    curl = FakeCurl()
+    fingerprint = Fingerprint(tls_trust_anchors=["2.5.4.3", "2.5.4.10"])
+
+    _apply_fingerprint(
+        curl,
+        fingerprint,
+        existing_header_names=set(),
+        default_headers=False,
+    )
+
+    assert curl.options[CurlOpt.TLS_TRUST_ANCHORS] == "2.5.4.3,2.5.4.10"
+
+
+def test_apply_fingerprint_does_not_set_unspecified_tls_trust_anchors():
+    curl = FakeCurl()
+
+    _apply_fingerprint(
+        curl,
+        Fingerprint(),
+        existing_header_names=set(),
+        default_headers=False,
+    )
+
+    assert CurlOpt.TLS_TRUST_ANCHORS not in curl.options
 
 
 def test_apply_fingerprint_empty_host_uses_curl_generated_host():
