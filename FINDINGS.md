@@ -19,7 +19,7 @@ This branch rebases the fork onto upstream curl_cffi **0.16.4b1**
 Install (Linux x86_64, glibc >= 2.17, CPython >= 3.10):
 
 ```
-pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-3/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
 ```
 
 The wheel reports `curl-impersonate/2.2.3-bivis.2` in
@@ -229,6 +229,15 @@ Chrome 155 and 152 captures; both show 0 failed checks.
 | WebSocket with `http_version` v3/v3only through SOCKS5 | TCP (curl bootstraps WebSockets over HTTP/1.1 only) | only CONNECT, no UDP ASSOCIATE |
 | Local SOCKS5 relay matrix (`tests/integration/test_socks5_udp.py`, 34 cases) | chrome152-2: 0 pass; upstream 0.16.4b1: 25 pass | 34 pass |
 
+Also fixed while building the diagnostics (chrome152-4): curl_cffi's
+low-level `Curl` released its debug callback context after `perform()` and
+before `curl_easy_cleanup()`, while libcurl kept the pointer. With
+`VERBOSE` and a `DEBUGFUNCTION`, a second `perform()` or `close()` called
+into freed memory: the interpreter aborted, or another callback ran in its
+place. The requests API resets the handle between requests and was not
+affected. `tests/unittest/test_curl.py::test_debug_function_after_perform`
+covers it.
+
 ## 6. Known issues
 
 - **Google and YouTube over QUIC through the maintainer's test relays** often
@@ -302,7 +311,7 @@ On Ubuntu (Python 3.10 or newer; `sudo apt install python3-venv` first):
 
 ```
 python3 -m venv ~/h3test && . ~/h3test/bin/activate
-pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-3/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
 curl -LO https://raw.githubusercontent.com/Bivis54/curl_cffi/cursor/quic-socks5-chrome-parity-ef8a/scripts/test_real_proxies.py
 read -rsp "proxyshard URL: " PROXYSHARD_SOCKS5_URL && export PROXYSHARD_SOCKS5_URL; echo
 read -rsp "soax URL: " SOAX_SOCKS5_URL && export SOAX_SOCKS5_URL; echo
@@ -355,6 +364,185 @@ Other options: `--rounds`, `--concurrency`, `--timeout`, `--json FILE`,
 `--show-ips`, `--direct`, and `--no-exit-ip-check` for local test proxies,
 which exit from the same machine. CI runs the script against two local
 proxies, one in single-target mode with authentication, to keep it working.
+
+## 9. Test protocol for the owner's server
+
+For a server like the owner's (Ubuntu 24.04, x86_64, Python 3.12). Run it in
+bash. The first block is only needed when the proxy URLs are not exported yet:
+it reads them without echoing them or putting them in the shell history.
+
+```bash
+read -rsp "PROXYSHARD_SOCKS5_URL: " PROXYSHARD_SOCKS5_URL; echo; export PROXYSHARD_SOCKS5_URL
+read -rsp "SOAX_SOCKS5_URL: " SOAX_SOCKS5_URL; echo; export SOAX_SOCKS5_URL
+```
+
+Then paste this block unchanged. It works in `~/h3-protocol`, runs in a child
+shell (a failure cannot close the terminal), pins the test tools to commit
+`ceae661` and installs the chrome152-4 wheel with one pip command:
+
+```bash
+mkdir -p ~/h3-protocol && bash <<'PROTOCOL' 2>&1 | tee ~/h3-protocol/protocol.log
+set -u
+export PYTHONUNBUFFERED=1
+REV=ceae6615e433e28196269f34f62d3ee9c73d0a7e
+WHEEL=https://github.com/Bivis54/curl_cffi/releases/download/chrome152-4/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+RAW="https://raw.githubusercontent.com/Bivis54/curl_cffi/$REV"
+W="$HOME/h3-protocol"
+cd "$W" || exit 1
+rm -rf venv tools groundtruth traces fp results.txt ./*.json
+mkdir -p tools groundtruth fp traces
+step() { printf '\n==================== %s  [%s] ====================\n' "$*" "$(date -u +%T)"; }
+record() { printf 'RESULT %-28s %s\n' "$1" "$2"; printf '%-28s %s\n' "$1" "$2" >> "$W/results.txt"; }
+verdict() { if [ "$1" = 0 ]; then echo PASS; else echo "FAIL (exit $1)"; fi; }
+PROVIDERS="proxyshard:PROXYSHARD_SOCKS5_URL soax:SOAX_SOCKS5_URL"
+
+step "0 environment"
+date -u +%Y-%m-%dT%H:%M:%SZ; uname -srm; (. /etc/os-release && echo "$PRETTY_NAME")
+python3 --version; echo "cpus $(nproc)"; free -m | sed -n 2p
+ip -br addr 2>/dev/null; ip route get 1.1.1.1 2>/dev/null | head -1
+echo "ipv6 default route: $(ip -6 route show default 2>/dev/null | head -1)"
+ip -o link 2>/dev/null | awk '{print "link", $2, $4, $5}'
+echo "ntp synchronized: $(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+for p in $PROVIDERS; do
+  v=${p#*:}
+  if [ -n "${!v:-}" ]; then echo "$v: set, scheme ${!v%%://*}"; else echo "$v: NOT SET"; fi
+done
+
+step "1 fresh venv"
+if python3 -m venv venv >/dev/null 2>&1; then
+  record venv PASS
+else
+  rm -rf venv
+  echo "python3 -m venv needs python3.12-venv; using --without-pip and get-pip.py"
+  if python3 -m venv --without-pip venv && curl -fsSL https://bootstrap.pypa.io/get-pip.py | venv/bin/python - -q; then
+    record venv "PASS (pip bootstrapped)"
+  else
+    record venv FAIL; exit 1
+  fi
+fi
+. venv/bin/activate
+
+step "2 install the wheel from the GitHub release"
+if pip install --no-cache-dir --disable-pip-version-check --progress-bar off "$WHEEL"; then record install PASS; else record install FAIL; exit 1; fi
+echo "criteria: curl-impersonate/2.2.3-bivis.N build and the three patched-build markers"
+python - <<'EOF'
+import inspect
+import sys
+
+import curl_cffi
+from curl_cffi import CurlWsFlag
+from curl_cffi.requests.websockets import WebSocket
+
+print(curl_cffi.__version__, curl_cffi.__curl_version__)
+checks = {
+    "fork build (curl-impersonate/2.2.3-bivis)": "-bivis" in curl_cffi.__curl_version__,
+    "CurlWsFlag.DEFLATE == 128": int(CurlWsFlag.DEFLATE) == 128,
+    "WebSocket._inflate": callable(getattr(WebSocket, "_inflate", None)),
+    "own PONG in recv_fragment": "CurlWsFlag.PONG" in inspect.getsource(WebSocket.recv_fragment),
+}
+for name, ok in checks.items():
+    print("PASS" if ok else "FAIL", name)
+sys.exit(0 if all(checks.values()) else 1)
+EOF
+record markers "$(verdict $?)"
+
+step "3 download the test tools (pinned to $REV)"
+ok=0
+for f in scripts/test_real_proxies.py scripts/diagnose_real_proxies.py \
+         tests/quic_bench/capture_curl_cffi.py tests/quic_bench/fingerprint_diff.py \
+         tests/groundtruth/chrome155.json tests/groundtruth/chrome154_dns_ech.json; do
+  case $f in *.json) dir=groundtruth;; *) dir=tools;; esac
+  curl -fsSL -o "$dir/${f##*/}" "$RAW/$f" || { echo "download failed: $f"; ok=1; }
+done
+record download "$(verdict $ok)"; [ $ok = 0 ] || exit 1
+
+step "4 verbose diagnostics (curl SOCKS5, QUIC, UDP, TLS traces)"
+echo "criteria: printed per probe; RESULT lines below. The direct baseline needs UDP egress"
+echo "from this machine and only tells relay problems from client problems."
+python tools/diagnose_real_proxies.py --direct --providers "" --trace-dir traces --json diagnose-direct.json
+record "diagnostics direct" "$(verdict $?)"
+for p in $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  [ -n "${!v:-}" ] || { record "diagnostics $name" "SKIP ($v not set)"; continue; }
+  python tools/diagnose_real_proxies.py --providers "$name" --trace-dir traces --json "diagnose-$name.json"
+  record "diagnostics $name" "$(verdict $?)"
+done
+
+step "5 real-proxy matrix (socks5h/socks5 x v3only/v3, sequential, concurrent, fingerprint)"
+echo "criteria: every request completes over HTTP/3 (proto h3); Cloudflare reports"
+echo "http=http/3 from an exit address other than this machine's; JA4 = Chrome (else FAIL);"
+echo "HTTP/3 hash = Chrome (else WARN, a quic.browserleaks.com race; re-run)."
+python tools/test_real_proxies.py --direct --providers "" --rounds 1 --concurrency 1 --json real-direct.json
+record "matrix direct" "$(verdict $?)"
+for p in $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  [ -n "${!v:-}" ] || { record "matrix $name" "SKIP ($v not set)"; continue; }
+  python tools/test_real_proxies.py --providers "$name" --json "real-$name.json"
+  record "matrix $name" "$(verdict $?)"
+done
+
+step "6 QUIC/TLS fingerprint vs Chrome (structural comparator)"
+echo "criteria: 0 failed checks against Chrome 155 (GREASE ECH, as through proxies) or,"
+echo "when the capture used real ECH (direct, ECH configs from DNS), Chrome 154 with DNS ECH."
+for p in direct:- $PROVIDERS; do
+  name=${p%%:*} v=${p#*:}
+  if [ "$v" = - ]; then opt=(); else
+    [ -n "${!v:-}" ] || { record "fingerprint $name" "SKIP ($v not set)"; continue; }
+    opt=(--proxy-env "$v")
+  fi
+  python tools/capture_curl_cffi.py --out fp --label "$name" "${opt[@]}"
+  python tools/fingerprint_diff.py groundtruth/chrome155.json "fp/$name.json" \
+    --ech-reference groundtruth/chrome154_dns_ech.json
+  record "fingerprint $name" "$(verdict $?)"
+done
+
+step "7 summary"
+python - <<'EOF'
+import glob
+import json
+from collections import Counter
+
+for path in sorted(glob.glob("diagnose-*.json")):
+    for p in json.load(open(path)):
+        if p["result"] != "PASS":
+            print(f"FAIL  diagnostics {p['provider']}/{p['name']}: {p['errors'][0][:150]}")
+for path in sorted(glob.glob("real-*.json")):
+    checks = json.load(open(path))["checks"]
+    counts = Counter((c["provider"], c["result"]) for c in checks)
+    for provider in sorted({c["provider"] for c in checks}):
+        hosts = Counter()
+        for c in checks:
+            if c["provider"] == provider and c["result"] == "FAIL":
+                hosts[c["target"]] += 1
+        print(
+            f"matrix {provider}: {counts[(provider, 'PASS')]} PASS, "
+            f"{counts[(provider, 'WARN')]} WARN, {counts[(provider, 'FAIL')]} FAIL"
+            + (f" (failed by host: {dict(hosts)})" if hosts else "")
+        )
+EOF
+cat results.txt
+PROTOCOL
+(cd ~/h3-protocol && tar -czf report.tar.gz protocol.log results.txt traces fp ./*.json) && echo "report: ~/h3-protocol/report.tar.gz"
+```
+
+| Step | Checks | PASS when |
+| --- | --- | --- |
+| 0 | OS, Python, interfaces and MTU, IPv6 route, NTP, which variables are set | informational |
+| 1 | fresh venv | created; without python3.12-venv, pip is bootstrapped with get-pip.py |
+| 2 | one `pip install` of the release wheel, patched-build markers | fork build, `CurlWsFlag.DEFLATE`, `WebSocket._inflate`, PONG in `recv_fragment` |
+| 3 | download the tools | every file downloaded |
+| 4 | `diagnose_real_proxies.py`: direct baseline, then each provider | every probe meets the criteria it prints (TCP through the proxy, HTTP/3 through `socks5h://` and `socks5://` with the UDP relay in the trace, 0-RTT resumption, Google) |
+| 5 | `test_real_proxies.py`: direct baseline, then each provider | every request over HTTP/3; Cloudflare saw HTTP/3 from an address other than the server's; JA4 = Chrome |
+| 6 | fingerprint capture and structural comparator | 0 failed checks against Chrome |
+| 7 | summary | lists every failed check with its reason |
+
+The output goes to the terminal and `~/h3-protocol/protocol.log`;
+`~/h3-protocol/report.tar.gz` adds the full curl traces, the JSON results
+and the fingerprint snapshots. None of it contains the proxy URLs,
+credentials, hosts or addresses, or the exit addresses. The direct baseline
+needs UDP egress from the server; it only separates relay problems from
+client problems. The run takes about 10 minutes, longer when Google or the
+direct baseline time out.
 
 Upstream issues:
 [#842](https://github.com/lexiforest/curl_cffi/issues/842) and
