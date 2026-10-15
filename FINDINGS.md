@@ -111,8 +111,9 @@ counts datagrams to a second destination:
 Routers that "just work" with soax (tun2socks, sing-box, Clash and similar)
 do the same thing: one association per UDP flow (source and destination),
 DNS resolved separately, never mixing destinations, so they never hit the
-restriction. Real soax and proxyshard credentials have not been provided
-yet; `test_real_proxy` runs against any list in `SOCKS5_UDP_PROXIES`.
+restriction. The real soax and proxyshard accounts are tested with
+`scripts/test_real_proxies.py` (section 8), which the owner runs with the
+credentials.
 
 ### `v3` races TCP behind a proxy
 
@@ -256,7 +257,8 @@ Chrome 155 and 152 captures; both show 0 failed checks.
   `struct curl_certinfo *` result as a `curl_slist` and frees curl's memory.
   This is upstream curl_cffi code, unchanged here.
 - Only Linux x86_64 wheels are built (section 1).
-- Real soax and proxyshard runs are pending credentials.
+- Real soax and proxyshard results come from `scripts/test_real_proxies.py`
+  runs on the owner's machine (section 8); CI cannot hold the credentials.
 
 ## 7. Test bench
 
@@ -286,6 +288,73 @@ python tests/quic_bench/capture_curl_cffi.py --out snap --proxy socks5h://user:p
 python tests/quic_bench/fingerprint_diff.py tests/groundtruth/chrome155.json snap/curl_cffi.json
 SOCKS5_UDP_PROXIES=socks5h://user:pass@host:port RUN_SLOW_TESTS=1 python -m pytest tests/integration
 ```
+
+## 8. Testing real providers
+
+`scripts/test_real_proxies.py` needs only the installed wheel (no checkout,
+no test dependencies) and reads the proxies from `PROXYSHARD_SOCKS5_URL` and
+`SOAX_SOCKS5_URL` (`socks5h://user:pass@host:port`). It never prints them:
+errors are scrubbed of the URL, the credentials and the proxy host, the JSON
+file contains no URLs, and exit addresses are hidden unless `--show-ips` is
+given.
+
+On Ubuntu (Python 3.10 or newer; `sudo apt install python3-venv` first):
+
+```
+python3 -m venv ~/h3test && . ~/h3test/bin/activate
+pip install https://github.com/Bivis54/curl_cffi/releases/download/chrome152-3/curl_cffi-0.16.4b1-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+curl -LO https://raw.githubusercontent.com/Bivis54/curl_cffi/cursor/quic-socks5-chrome-parity-ef8a/scripts/test_real_proxies.py
+read -rsp "proxyshard URL: " PROXYSHARD_SOCKS5_URL && export PROXYSHARD_SOCKS5_URL; echo
+read -rsp "soax URL: " SOAX_SOCKS5_URL && export SOAX_SOCKS5_URL; echo
+python test_real_proxies.py --json results.json
+```
+
+`read -s` keeps the URLs off the screen and out of the shell history. A
+provider whose variable is unset is skipped; `--providers soax` runs one.
+
+Per provider, 26 requests by default (about a minute):
+
+| Test | Requests |
+| --- | --- |
+| matrix | Cloudflare's trace endpoint through `socks5h://` and `socks5://` with `v3only` and `v3` |
+| sequential | 3 rounds over cloudflare-quic.com, www.google.com, quic.browserleaks.com and fp.impersonate.pro |
+| concurrent | 2 requests per host at once |
+| fingerprint | a fresh and a resumed connection on quic.browserleaks.com, compared with Chrome 152 |
+
+Every request uses a new QUIC connection and therefore a new UDP association,
+so single-target relays are exercised the way curl uses them; later
+sequential requests to a host resume with 0-RTT. In the matrix, `v3` gets a
+5 s happy-eyeballs window so that one lost UDP packet does not hand the race
+to TCP. A request passes when it completed over HTTP/3. The Cloudflare rows
+also need Cloudflare to report `http=http/3` from an address other than this
+machine's, which is looked up directly over TCP at the start; otherwise the
+proxy was bypassed. The script prints progress marks, a table with protocol,
+status, time and details per request, a summary per provider and host, and
+the scrubbed errors. Exit status: 0 when nothing failed, 1 when a check
+failed, 2 when no provider is configured, 3 when the script itself failed.
+
+Reading failures:
+
+- `curl: (55) ... ERR_HANDSHAKE_TIMEOUT` or `curl: (28) ... 0 bytes
+  received`: no QUIC handshake through the relay. `--direct` repeats the
+  requests without a proxy; if they pass there, the provider's UDP path loses
+  packets to that host. Google through the maintainer's test relays fails
+  this way for every client (section 6).
+- `curl: (97)`: the proxy rejected the SOCKS5 handshake, the credentials or
+  UDP ASSOCIATE. `curl: (7)`: the proxy is unreachable.
+- `completed over h2` or `Cloudflare received http/2`: the request did not
+  use QUIC, which `v3only` should never allow.
+- `exit address is this machine's: proxy bypassed`: QUIC went around the
+  proxy.
+- `JA4 ..., Chrome ...` is a real fingerprint difference. A `WARN` row with
+  an HTTP/3 text is the quic.browserleaks.com race from section 6; re-run.
+- `no 0-RTT on resumption`: the relay dropped the 0-RTT packets or the
+  server rejected early data.
+
+Other options: `--rounds`, `--concurrency`, `--timeout`, `--json FILE`,
+`--show-ips`, `--direct`, and `--no-exit-ip-check` for local test proxies,
+which exit from the same machine. CI runs the script against two local
+proxies, one in single-target mode with authentication, to keep it working.
 
 Upstream issues:
 [#842](https://github.com/lexiforest/curl_cffi/issues/842) and
