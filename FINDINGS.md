@@ -279,5 +279,9 @@ python tests/quic_bench/fingerprint_diff.py tests/groundtruth/chrome155.json sna
 SOCKS5_UDP_PROXIES=socks5h://user:pass@host:port RUN_SLOW_TESTS=1 python -m pytest tests/integration
 ```
 
-Issues: #842, #843 (SOCKS5 UDP regression), #743 (`v3` with a proxy), #837
+Upstream issues:
+[#842](https://github.com/lexiforest/curl_cffi/issues/842) and
+[#843](https://github.com/lexiforest/curl_cffi/issues/843) (SOCKS5 UDP
+regression), [#743](https://github.com/lexiforest/curl_cffi/issues/743)
+(`v3` with a proxy), [#837](https://github.com/lexiforest/curl_cffi/issues/837)
 (CLOSE_WAIT).
