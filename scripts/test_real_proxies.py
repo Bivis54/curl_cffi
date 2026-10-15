@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import platform
+import re
+import socket
 import sys
 import time
 import traceback
@@ -76,23 +79,57 @@ class Check:
 
 
 class Redactor:
-    """Replaces the proxy URLs, their credentials and hosts in text."""
+    """Replaces the proxy URLs, their credentials, hosts and addresses in text."""
 
     def __init__(self, urls: list[str]) -> None:
-        secrets = set()
+        secrets, addresses, ports = set(), set(), set()
         for url in urls:
             secrets.add(url)
             parts = urlsplit(url)
+            if parts.port:
+                ports.add(parts.port)
             for value in (parts.netloc, parts.username, parts.password):
                 if value:
                     secrets.update((value, unquote(value)))
             if parts.hostname:
-                secrets.add(parts.hostname)
+                try:
+                    addresses.add(str(ipaddress.ip_address(parts.hostname)))
+                except ValueError:
+                    secrets.add(parts.hostname)
+                try:
+                    infos = socket.getaddrinfo(parts.hostname, None)
+                except OSError:
+                    infos = []
+                addresses.update(str(info[4][0]) for info in infos)
         self.secrets = sorted((s for s in secrets if len(s) >= 3), key=len)[::-1]
+        # Whole addresses only (1.2.3.4 must not hit 11.2.3.45), ports may follow.
+        self.addresses = [
+            re.compile(rf"(?<![0-9A-Fa-f:]){re.escape(a)}(?![0-9A-Fa-f])")
+            if ":" in a
+            else re.compile(rf"(?<![\d.]){re.escape(a)}(?!\d|\.\d)")
+            for a in addresses
+        ]
+        # The proxy port right after a hidden host, and any address followed by
+        # it (DNS may answer curl differently); UDP relay ports stay.
+        self.ports = [
+            re.compile(rf"(<hidden>\]?(?: \(<hidden>\))?(?::| port )){p}(?!\d)")
+            for p in ports
+        ]
+        self.at_ports = [
+            re.compile(rf"(?<![\w.:\[])(\[?)[0-9A-Fa-f:.]*[0-9A-Fa-f](\]?):{p}(?!\d)")
+            for p in ports
+        ]
 
     def __call__(self, text: str) -> str:
         for secret in self.secrets:
             text = text.replace(secret, "<hidden>")
+        for address in self.addresses:
+            text = address.sub("<hidden>", text)
+        for at_port in self.at_ports:
+            text = at_port.sub(r"\1<hidden>\2:<port>", text)
+        text = re.sub(r"(Connected to <hidden> \()[^)\s]+(\))", r"\1<hidden>\2", text)
+        for port in self.ports:
+            text = port.sub(r"\1<port>", text)
         return text
 
 
