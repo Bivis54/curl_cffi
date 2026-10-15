@@ -45,6 +45,7 @@ from test_real_proxies import (
     PROVIDERS,
     TARGETS,
     Redactor,
+    chrome_ja4,
     direct_ip,
     load_providers,
 )
@@ -281,7 +282,8 @@ class Diagnosis:
             "resume",
             "two connections to quic.browserleaks.com over HTTP/3; the first has "
             f"JA4 {CHROME_JA4['fresh']}, the second resumes with 0-RTT: JA4 "
-            f"{CHROME_JA4['resumed']}, quic.0-rtt true and 'server did accept N "
+            f"{CHROME_JA4['resumed']} ({CHROME_JA4['resumed-ech']} when ECH configs "
+            "came from DNS), quic.0-rtt true and 'server did accept N "
             "bytes of early data' in the trace",
         )
         tracer = Tracer()
@@ -303,8 +305,9 @@ class Diagnosis:
             probe.observed.append(
                 f"{kind}: JA4 {ja4}, h3_hash {data.get('h3_hash')}, 0-rtt {zero_rtt}"
             )
-            if ja4 != CHROME_JA4[kind]:
-                probe.errors.append(f"{kind}: JA4 {ja4}, Chrome {CHROME_JA4[kind]}")
+            expected = chrome_ja4(kind, data)
+            if ja4 != expected:
+                probe.errors.append(f"{kind}: JA4 {ja4}, Chrome {expected}")
             if kind == "resumed" and not zero_rtt:
                 probe.errors.append("resumed: no 0-RTT")
         self.finish(curl)

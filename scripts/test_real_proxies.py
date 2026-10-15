@@ -59,7 +59,18 @@ TARGETS = {
 CHROME_JA4 = {
     "fresh": "q13d0312h3_55b375c5d22e_178839b6cec1",
     "resumed": "q13d0314h3_55b375c5d22e_79cc91d6b50c",
+    # With ECH configs from DNS (direct connections, not through a proxy) the
+    # PSK goes into the encrypted inner ClientHello, as with Chrome.
+    "resumed-ech": "q13d0313h3_55b375c5d22e_27b11b7e031e",
 }
+
+
+def chrome_ja4(kind: str, data: dict) -> str:
+    """Chrome's JA4 for a fresh or resumed quic.browserleaks.com connection."""
+    ech = ((data.get("tls") or {}).get("ech") or {}).get("ech_success")
+    return CHROME_JA4["resumed-ech" if kind == "resumed" and ech else kind]
+
+
 CHROME_H3_HASH = "ba909fc3dc419ea5c5b26c6323ac1879"
 HTTP3 = 30  # CURLINFO_HTTP_VERSION of HTTP/3
 PROTOCOLS = {1: "h1.0", 2: "h1.1", 3: "h2", HTTP3: "h3"}
@@ -277,11 +288,11 @@ class Runner:
                     continue
                 data = self.evaluate(check, r)
                 check.details.clear()
-                ja4 = data.get("ja4")
-                if ja4 == CHROME_JA4[kind]:
+                ja4, expected = data.get("ja4"), chrome_ja4(kind, data)
+                if ja4 == expected:
                     check.details.append("JA4 = Chrome")
                 else:
-                    check.errors.append(f"JA4 {ja4}, Chrome {CHROME_JA4[kind]}")
+                    check.errors.append(f"JA4 {ja4}, Chrome {expected}")
                 if data.get("h3_hash") == CHROME_H3_HASH:
                     check.details.append("HTTP/3 hash = Chrome")
                 elif not check.errors:
