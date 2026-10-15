@@ -7,6 +7,7 @@ counts and ordering behaviour must match exactly. Prints every check and
 exits with status 1 if any required check fails.
 
 usage: fingerprint_diff.py REFERENCE CANDIDATE [--optional CHECK ...]
+                           [--ech-reference FILE]
 """
 
 from __future__ import annotations
@@ -267,9 +268,22 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="check name to report as a warning instead of a failure",
     )
+    parser.add_argument(
+        "--ech-reference",
+        metavar="FILE",
+        help="reference for candidates whose first connection used real ECH "
+        "(ECH configs from DNS, like Chrome on direct connections)",
+    )
     args = parser.parse_args(argv)
-    ref = json.loads(Path(args.reference).read_text())
+    reference = args.reference
     cand = json.loads(Path(args.candidate).read_text())
+    first = entry_data(cand, "browserleaks_first")
+    if args.ech_reference and (first.get("tls") or {}).get("ech", {}).get(
+        "ech_success"
+    ):
+        print(f"candidate used real ECH, comparing with {args.ech_reference}")
+        reference = args.ech_reference
+    ref = json.loads(Path(reference).read_text())
     return 1 if diff(ref, cand, set(args.optional)).failed else 0
 
 
