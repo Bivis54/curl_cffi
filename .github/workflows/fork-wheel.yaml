@@ -173,6 +173,29 @@ jobs:
         /tmp/venv/bin/python -m pytest -p no:cacheprovider -rA integration/test_socks5_udp.py -k real_proxy \
           2>&1 | tee "$GITHUB_WORKSPACE/results/real-proxies.log"
 
+    - name: scripts/test_real_proxies.py against local proxies
+      working-directory: /tmp
+      run: |
+        bench=/tmp/ci/tests/quic_bench
+        results="$GITHUB_WORKSPACE/results"
+        /tmp/venv/bin/python $bench/socks5_udp.py 1082 "$results/script-proxy-plain.log" &
+        plain=$!
+        /tmp/venv/bin/python $bench/socks5_udp.py 1083 "$results/script-proxy-single-target.log" \
+          --single-target --require-auth &
+        single=$!
+        sleep 2
+        status=0
+        # The local proxies exit from this runner, hence --no-exit-ip-check.
+        PROXYSHARD_SOCKS5_URL=socks5h://user:pass@127.0.0.1:1082 \
+        SOAX_SOCKS5_URL=socks5h://user:pass@127.0.0.1:1083 \
+          /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/test_real_proxies.py" \
+          --no-exit-ip-check --rounds 2 --json "$results/test_real_proxies.json" \
+          | tee "$results/test_real_proxies.txt" || status=$?
+        kill $plain $single
+        # 1 means some request failed, reported above; anything else is a
+        # broken script.
+        [ $status -le 1 ]
+
     - uses: actions/upload-artifact@v4
       if: always()
       with:
