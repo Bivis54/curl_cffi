@@ -41,16 +41,10 @@ from time import sleep as sync_sleep
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypeVar, final
 from warnings import warn as user_warning
-from zlib import (
-    DEFLATED,
-    MAX_WBITS,
-    Z_DEFAULT_COMPRESSION,
-    Z_SYNC_FLUSH,
-    compressobj,
-    decompressobj,
-)
+from zlib import MAX_WBITS, decompressobj
 from zlib import error as ZlibError
 
+from .._wrapper import ffi, lib
 from ..aio import CURL_SOCKET_BAD, get_selector
 from ..const import CurlECode, CurlFollow, CurlInfo, CurlOpt, CurlWsFlag
 from ..curl import Curl, CurlError, CurlShare
@@ -62,7 +56,6 @@ from .utils import NOT_SET, HttpVersionLiteral, NotSetType, set_curl_options
 if TYPE_CHECKING:
     from typing import ClassVar, Final
     from weakref import ReferenceType
-    from zlib import _Compress as ZlibCompressor  # pyright: ignore[reportPrivateUsage]
     from zlib import _Decompress as ZlibDecompressor  # pyright: ignore[reportPrivateUsage]
 
     from ..const import CurlHttpVersion
@@ -529,7 +522,7 @@ class WebSocket(BaseWebSocket):
         # Window bits and client_no_context_takeover the server accepted for
         # permessage-deflate, None when it did not; and the matching deflater.
         self._deflate_params: tuple[int, bool] | None = None
-        self._deflator: ZlibCompressor | None = None
+        self._deflator: object | None = None
         self.share: CurlShare | None = share
 
         self._emitters: dict[EventTypeLiteral, Callable[..., object]] = {}
@@ -1180,24 +1173,29 @@ class WebSocket(BaseWebSocket):
 
         One deflate stream serves the whole connection, so later messages can
         refer back to earlier ones, unless the server asked for
-        ``client_no_context_takeover``.
+        ``client_no_context_takeover``. Compression is done as Chrome does it,
+        with Chromium's zlib, so the frames are the ones Chrome would send;
+        with 8 window bits it uses 9 like Chrome, as zlib keeps back-references
+        within 2**9 - 262 bytes, which a 2**8 window still decodes.
         """
         if self._deflate_params is None:
             raise WebSocketError("permessage-deflate was not negotiated")
-        window_bits, no_context_takeover = self._deflate_params
-        deflator: ZlibCompressor | None = self._deflator
-        if deflator is None:
-            # zlib cannot compress raw deflate with 8 window bits. Like Chrome,
-            # use 9: zlib keeps back-references within 2**9 - 262 bytes, which
-            # a 2**8 window still decodes.
-            deflator = compressobj(
-                Z_DEFAULT_COMPRESSION, DEFLATED, -max(window_bits, 9)
-            )
-            self._deflator = deflator
-        data: bytes = deflator.compress(payload) + deflator.flush(Z_SYNC_FLUSH)
-        if no_context_takeover:
-            self._deflator = None
-        return data[:-4] if data.endswith(_DEFLATE_TAIL) else data
+        if self._deflator is None:
+            window_bits, no_context_takeover = self._deflate_params
+            deflator = lib._ws_deflater_new(window_bits, int(no_context_takeover))
+            if deflator == ffi.NULL:
+                raise WebSocketError("Failed to set up permessage-deflate")
+            self._deflator = ffi.gc(deflator, lib._ws_deflater_free)
+        out = ffi.new("unsigned char **")
+        out_len = ffi.new("size_t *")
+        if lib._ws_deflate(
+            self._deflator, ffi.from_buffer(payload), len(payload), out, out_len
+        ):
+            raise WebSocketError("Failed to compress the message")
+        try:
+            return ffi.buffer(out[0], out_len[0])[:]
+        finally:
+            lib._ws_deflate_free_buffer(out[0])
 
     def _send_frames(
         self,

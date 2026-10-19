@@ -228,7 +228,13 @@ ffibuilder.set_source(
     ],
     sources=[
         str(root_dir / "ffi/shim.c"),
+        # Chromium's zlib for outgoing WebSocket compression, see its README
+        *(
+            str(root_dir / "ffi/chromium_zlib" / name)
+            for name in ("deflate.c", "trees.c", "zutil.c", "adler32.c")
+        ),
     ],
+    define_macros=[("CPU_NO_SIMD", None), ("NO_GZIP", None)],
     extra_compile_args=(
         ["-Wno-implicit-function-declaration"] if system == "Darwin" else []
     ),

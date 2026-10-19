@@ -1,6 +1,7 @@
 recursive-include tests *
 
 include ffi/*
+recursive-include ffi/chromium_zlib *
 include include/curl/*
 include scripts/build.py
 include Makefile
