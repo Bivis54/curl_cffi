@@ -323,6 +323,26 @@ Both clients support exponential backoff with jitter for retrying transient netw
     # Works in both session.ws_connect and async_session.ws_connect
     ws = session.ws_connect(url, ws_retry=retry_policy)
 
+Resuming TLS Sessions on Reconnect
+----------------------------------
+
+A browser that reconnects comes back with the TLS session of its previous connection to the host (a TLS 1.2 session ticket or a TLS 1.3 PSK). Every ``WebSocket`` has a curl handle of its own, so without help each new connection makes a full handshake. Give the connections one ``CurlShare``: its TLS session cache outlives ``terminate()``, and ``Session`` requests with the same share fill it too.
+
+.. code-block:: python
+
+    from curl_cffi import CurlShare, Session, WebSocket
+
+    share = CurlShare()  # one per browser identity, e.g. per account
+    session = Session(impersonate="chrome", share=share)
+    session.get("https://example.com/")
+
+    ws = WebSocket(share=share).connect("wss://example.com/ws", impersonate="chrome")
+    ws.terminate()
+    # resumes the session of the request or of the first socket
+    ws = WebSocket(share=share).connect("wss://example.com/ws", impersonate="chrome")
+
+Servers can link the connections that resume each other's sessions, so do not share one cache between identities that should look unrelated.
+
 Message Limits
 --------------
 

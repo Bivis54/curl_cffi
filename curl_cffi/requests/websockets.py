@@ -53,7 +53,7 @@ from zlib import error as ZlibError
 
 from ..aio import CURL_SOCKET_BAD, get_selector
 from ..const import CurlECode, CurlFollow, CurlInfo, CurlOpt, CurlWsFlag
-from ..curl import Curl, CurlError
+from ..curl import Curl, CurlError, CurlShare
 from ..utils import CurlCffiWarning
 from .exceptions import SessionClosed, Timeout
 from .models import Response
@@ -459,6 +459,7 @@ class WebSocket(BaseWebSocket):
         "_write_selector",
         "compress",
         "keep_running",
+        "share",
     )
 
     def __init__(
@@ -476,6 +477,7 @@ class WebSocket(BaseWebSocket):
         ws_retry: WebSocketRetryStrategy | None = None,
         max_message_size: int = 4 * 1024 * 1024,
         compress: bool = True,
+        share: CurlShare | None = None,
     ) -> None:
         """
         Args:
@@ -500,6 +502,11 @@ class WebSocket(BaseWebSocket):
             compress (bool, optional): Compress outgoing data messages when the
                 server accepted permessage-deflate, as browsers do. ``False``
                 sends them uncompressed, e.g. for debugging.
+            share (CurlShare | None, optional): Share whose TLS session cache
+                the connection uses: it resumes a session an earlier connection
+                with the same share got from the host, and its own sessions stay
+                in the share after ``terminate()``. Without one, every
+                connection makes a full handshake.
         """
         super().__init__(
             curl=curl,
@@ -523,6 +530,7 @@ class WebSocket(BaseWebSocket):
         # permessage-deflate, None when it did not; and the matching deflater.
         self._deflate_params: tuple[int, bool] | None = None
         self._deflator: ZlibCompressor | None = None
+        self.share: CurlShare | None = share
 
         self._emitters: dict[EventTypeLiteral, Callable[..., object]] = {}
         if on_open:
@@ -689,6 +697,7 @@ class WebSocket(BaseWebSocket):
         ) = None,
         dns: str | list[str] | None = None,
         doh_url: str | None = None,
+        share: CurlShare | None = None,
     ) -> WebSocket:
         """Connect to the WebSocket.
 
@@ -734,6 +743,8 @@ class WebSocket(BaseWebSocket):
             cert: a tuple of (cert, key) filenames for client cert.
             max_recv_speed: maximum receive speed, bytes per second.
             curl_options: extra curl options to use.
+            share: ``CurlShare`` for the TLS session cache, instead of the one
+                given to the constructor.
 
         Note:
             The ``WebSocket`` is NOT thread-safe, add your own locking
@@ -787,6 +798,7 @@ class WebSocket(BaseWebSocket):
                 max_recv_speed=max_recv_speed,
                 cert=cert,
                 curl_options=curl_options,
+                share=share if share is not None else self.share,
             )
 
             # Magic number defined in: https://curl.se/docs/websocket.html

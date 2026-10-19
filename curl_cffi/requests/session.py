@@ -36,7 +36,7 @@ from weakref import WeakSet
 
 from ..aio import AsyncCurl
 from ..const import CurlFollow, CurlHttpVersion, CurlInfo, CurlOpt
-from ..curl import Curl, CurlError, CurlMime
+from ..curl import Curl, CurlError, CurlMime, CurlShare
 from ..utils import CurlCffiWarning
 from .cache import CacheSpec, normalize_cache_backend
 from .cookies import Cookies, CookieTypes
@@ -125,6 +125,7 @@ if TYPE_CHECKING:
         discard_cookies: bool
         raise_for_status: bool
         cache: Optional[CacheSpec]
+        share: Optional[CurlShare]
 
     class StreamRequestParams(TypedDict, total=False):
         params: Optional[Union[dict, list, tuple]]
@@ -260,6 +261,7 @@ class BaseSession(Generic[R]):
         discard_cookies: bool = False,
         raise_for_status: bool = False,
         cache: Optional[CacheSpec] = None,
+        share: Optional[CurlShare] = None,
     ):
         self.headers = Headers(headers)
         self._cookies = Cookies(cookies)  # guarded by @property
@@ -298,6 +300,7 @@ class BaseSession(Generic[R]):
         self.response_class = response_class or Response
         self.discard_cookies = discard_cookies
         self.raise_for_status = raise_for_status
+        self.share = share
 
         if proxy and proxies:
             raise TypeError("Cannot specify both 'proxy' and 'proxies'")
@@ -542,6 +545,9 @@ class Session(BaseSession[R]):
             response_class: A customized subtype of ``Response`` to use.
             raise_for_status: automatically raise an HTTPError for 4xx and 5xx
                 status codes.
+            share: a ``CurlShare`` whose TLS session cache the session's
+                connections use, so that they resume sessions that other
+                sessions or WebSockets with the same share got from a host.
 
         Notes:
             This class can be used as a context manager.
@@ -823,6 +829,7 @@ class Session(BaseSession[R]):
             cert=cert or self.cert,
             max_recv_speed=max_recv_speed,
             curl_options={**self.curl_options, **(curl_options or {})},
+            share=self.share,
         )
 
         try:
@@ -939,6 +946,7 @@ class Session(BaseSession[R]):
             curl_options=self.curl_options,
             queue_class=queue.Queue,
             event_class=threading.Event,
+            share=self.share,
         )
 
         if self._cache_enabled(req, stream=stream, content_callback=content_callback):
@@ -1210,6 +1218,9 @@ class AsyncSession(BaseSession[R]):
             response_class: A customized subtype of ``Response`` to use.
             raise_for_status: automatically raise an HTTPError for 4xx and 5xx
                 status codes.
+            share: a ``CurlShare`` whose TLS session cache the session's
+                connections use, so that they resume sessions that other
+                sessions or WebSockets with the same share got from a host.
 
         Notes:
             This class can be used as a context manager, and it's recommended to use via
@@ -1572,6 +1583,7 @@ class AsyncSession(BaseSession[R]):
                     event_class=asyncio.Event,
                     curl_options={**self.curl_options, **(curl_options or {})},
                     perk=perk or self.perk,
+                    share=self.share,
                 )
                 _ = curl.setopt(CurlOpt.TCP_NODELAY, 1)
                 _ = curl.setopt(
@@ -1743,6 +1755,7 @@ class AsyncSession(BaseSession[R]):
                 curl_options=self.curl_options,
                 queue_class=asyncio.Queue,
                 event_class=asyncio.Event,
+                share=self.share,
             )
         # Catch BaseException so asyncio.CancelledError also returns the handle.
         except BaseException:

@@ -33,7 +33,7 @@ from .models import Request
 from .streams import RequestContent, RequestData, _FileReader, _IterableReader
 
 if TYPE_CHECKING:
-    from ..curl import Curl
+    from ..curl import Curl, CurlShare
     from .cookies import CookieTypes
     from .headers import HeaderTypes
     from .impersonate import BrowserTypeLiteral, ExtraFpDict
@@ -653,6 +653,7 @@ def set_curl_options(
     queue_class: Any = None,
     event_class: Any = None,
     curl_options: Optional[dict[CurlOpt, str]] = None,
+    share: Optional[CurlShare] = None,
 ):
     c = curl
 
@@ -1065,6 +1066,9 @@ def set_curl_options(
     # max_recv_speed
     # do not check, since 0 is a valid value to disable it
     c.setopt(CurlOpt.MAX_RECV_SPEED_LARGE, max_recv_speed)
+
+    if share is not None:
+        c.setopt(CurlOpt.SHARE, share)
 
     # set extra options, after all others, because it will alter some options
     if curl_options:
