@@ -1,0 +1,75 @@
+websocket: let CURLWS_DEFLATE set RSV1 on outgoing frames
+
+0001 reports RSV1 on received frames as CURLWS_DEFLATE. Accept the same flag
+in curl_ws_send(): it sets RSV1 on the first frame of a TEXT or BINARY
+message, whose payload the application compressed for permessage-deflate
+(RFC 7692). Continuation frames never carry the bit and control frames are
+rejected. libcurl still compresses nothing itself.
+
+diff --git a/include/curl/websockets.h b/include/curl/websockets.h
+index 616dd99..8aef33e 100644
+--- a/include/curl/websockets.h
++++ b/include/curl/websockets.h
+@@ -59,7 +59,9 @@ CURL_EXTERN CURLcode curl_ws_recv(CURL *curl, void *buffer, size_t buflen,
+ /* flags for curl_ws_send() */
+ #define CURLWS_PONG       (1 << 6)
+ /* permessage-deflate: RSV1 marks a compressed payload (RFC 7692). Reported
+-   on receive only; libcurl does not compress outgoing frames. */
++   on receive. On send it sets RSV1 on the first frame of a TEXT or BINARY
++   message whose payload the application compressed; libcurl does not
++   compress anything itself. */
+ #define CURLWS_DEFLATE    (1 << 7)
+ 
+ /*
+diff --git a/lib/ws.c b/lib/ws.c
+index 34faf37..9f61860 100644
+--- a/lib/ws.c
++++ b/lib/ws.c
+@@ -470,10 +470,10 @@ static int ws_frame_firstbyte2flags(struct Curl_easy *data,
+   }
+ }
+ 
+-static CURLcode ws_frame_flags2firstbyte(struct Curl_easy *data,
+-                                         unsigned int flags,
+-                                         bool contfragment,
+-                                         uint8_t *pfirstbyte)
++static CURLcode ws_frame_type2firstbyte(struct Curl_easy *data,
++                                        unsigned int flags,
++                                        bool contfragment,
++                                        uint8_t *pfirstbyte)
+ {
+   *pfirstbyte = 0;
+   switch(flags & ~CURLWS_OFFSET) {
+@@ -533,6 +533,32 @@ static CURLcode ws_frame_flags2firstbyte(struct Curl_easy *data,
+   }
+ }
+ 
++/* curl-impersonate: CURLWS_DEFLATE sets RSV1 on the first frame of a TEXT
++   or BINARY message, marking the payload the application compressed for
++   permessage-deflate (RFC 7692). Continuation frames never carry it and
++   control frames must not. */
++static CURLcode ws_frame_flags2firstbyte(struct Curl_easy *data,
++                                         unsigned int flags,
++                                         bool contfragment,
++                                         uint8_t *pfirstbyte)
++{
++  bool rsv1 = FALSE;
++  CURLcode result;
++
++  if(flags & CURLWS_DEFLATE) {
++    if(!(flags & (CURLWS_TEXT | CURLWS_BINARY))) {
++      failf(data, "[WS] CURLWS_DEFLATE needs a TEXT or BINARY frame");
++      return CURLE_BAD_FUNCTION_ARGUMENT;
++    }
++    flags &= ~(unsigned int)CURLWS_DEFLATE;
++    rsv1 = !contfragment;
++  }
++  result = ws_frame_type2firstbyte(data, flags, contfragment, pfirstbyte);
++  if(!result && rsv1)
++    *pfirstbyte |= WSBIT_RSV1;
++  return result;
++}
++
+ static void ws_dec_info(struct ws_decoder *dec, struct Curl_easy *data,
+                         const char *msg)
+ {
