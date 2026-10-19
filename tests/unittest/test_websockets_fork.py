@@ -1,4 +1,4 @@
-"""The fork's WebSocket behaviour: permessage-deflate inflation and own PONGs.
+"""The fork's WebSocket behaviour: permessage-deflate and own PONGs.
 
 Downstream code detects a patched build by WebSocket._inflate, a PONG sent
 from recv_fragment() and CurlWsFlag.DEFLATE, so those are checked too.
@@ -11,14 +11,16 @@ import inspect
 import socket
 import threading
 import time
+import zlib
 from collections.abc import Awaitable, Callable
 from contextlib import closing
 
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
 
 from curl_cffi import AsyncSession, CurlECode, CurlError, CurlWsFlag, Session
-from curl_cffi.requests.websockets import WebSocket
+from curl_cffi.requests.websockets import WebSocket, _permessage_deflate_params
 
 DEFLATE_HEADER = {
     "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits"
@@ -35,11 +37,17 @@ def free_port() -> int:
 class Server:
     """websockets server running `handler` in a background event loop."""
 
-    def __init__(self, handler: Callable[[ServerConnection], Awaitable[None]]):
+    def __init__(
+        self,
+        handler: Callable[[ServerConnection], Awaitable[None]],
+        deflate: ServerPerMessageDeflateFactory | None = None,
+    ):
         self.port = free_port()
         self.url = f"ws://127.0.0.1:{self.port}"
         self.events: list[str] = []
         self._handler = handler
+        # None: websockets' "deflate" preset, 12-bit windows both ways
+        self._deflate = deflate
         self._ready = threading.Event()
         self._loop = asyncio.new_event_loop()
         self._stop: asyncio.Future[None] | None = None
@@ -51,7 +59,11 @@ class Server:
         async def main() -> None:
             self._stop = self._loop.create_future()
             async with serve(
-                self._handler, "127.0.0.1", self.port, compression="deflate"
+                self._handler,
+                "127.0.0.1",
+                self.port,
+                compression=None if self._deflate else "deflate",
+                extensions=[self._deflate] if self._deflate else None,
             ):
                 self._ready.set()
                 await self._stop
@@ -179,3 +191,134 @@ async def test_pong_from_async_reader():
             msg, _ = await ws.recv(timeout=20)
             await ws.close()
     assert msg == b"ok"
+
+
+async def echo(ws: ServerConnection) -> None:
+    async for message in ws:
+        await ws.send(message)
+
+
+ECHOED = ["hello", BIG.decode(), BIG.decode(), BIG, b"\x00\x01" * 70000]
+
+
+@pytest.mark.parametrize(
+    "deflate",
+    [
+        pytest.param(None, id="preset-12-bits"),
+        pytest.param(ServerPerMessageDeflateFactory(), id="15-bits"),
+        pytest.param(
+            ServerPerMessageDeflateFactory(client_no_context_takeover=True),
+            id="client-no-context-takeover",
+        ),
+        pytest.param(
+            ServerPerMessageDeflateFactory(client_max_window_bits=10),
+            id="client-10-bits",
+        ),
+        pytest.param(
+            ServerPerMessageDeflateFactory(client_max_window_bits=8),
+            id="client-8-bits",
+        ),
+    ],
+)
+def test_deflate_send(deflate: ServerPerMessageDeflateFactory | None):
+    # websockets decompresses what the client sends with the window and
+    # context the server asked for, and fails the connection otherwise.
+    with Server(echo, deflate) as srv, Session() as s:
+        ws = s.ws_connect(srv.url, headers=DEFLATE_HEADER)
+        assert ws._deflate_params is not None
+        got = []
+        for message in ECHOED:
+            if isinstance(message, str):
+                ws.send_str(message)
+            else:
+                ws.send(message)
+            msg, flags = ws.recv(timeout=5)
+            assert flags & CurlWsFlag.DEFLATE
+            got.append(msg.decode() if flags & CurlWsFlag.TEXT else msg)
+        ws.close()
+    assert got == ECHOED
+
+
+def test_deflate_send_off_and_not_negotiated():
+    with Server(echo) as srv, Session() as s:
+        ws = s.ws_connect(srv.url)
+        assert ws._deflate_params is None
+        assert ws.send_str("plain") == 5
+        assert ws.recv(timeout=5)[0] == b"plain"
+        ws.close()
+    with Server(echo) as srv:
+        ws = WebSocket(compress=False)
+        ws.connect(srv.url, headers=DEFLATE_HEADER)
+        assert ws.send_str("plain") == 5
+        assert ws.recv(timeout=5)[0] == b"plain"
+        ws.close()
+
+
+@pytest.mark.parametrize(
+    "head, params",
+    [
+        (b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n", None),
+        (
+            b"HTTP/1.1 101 OK\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            (15, False),
+        ),
+        (
+            b"HTTP/1.1 101 OK\r\nsec-websocket-extensions: permessage-deflate; "
+            b"client_no_context_takeover; server_max_window_bits=12\r\n\r\n",
+            (15, True),
+        ),
+        (
+            b"HTTP/1.1 101 OK\r\nSec-WebSocket-Extensions: x-foo, "
+            b'permessage-deflate; client_max_window_bits="10"\r\n\r\n',
+            (10, False),
+        ),
+        (
+            b"HTTP/1.1 200 Connection established\r\n\r\n"
+            b"HTTP/1.1 101 OK\r\nSec-WebSocket-Extensions: permessage-deflate; "
+            b"client_max_window_bits=9\r\n\r\n",
+            (9, False),
+        ),
+        (
+            b"HTTP/1.1 302 Found\r\nSec-WebSocket-Extensions: permessage-deflate\r\n"
+            b"\r\nHTTP/1.1 101 OK\r\nUpgrade: websocket\r\n\r\n",
+            None,
+        ),
+    ],
+)
+def test_permessage_deflate_params(head: bytes, params: tuple[int, bool] | None):
+    assert _permessage_deflate_params(head) == params
+
+
+def inflate(payloads: list[bytes], window_bits: int, shared: bool) -> list[bytes]:
+    out = []
+    inflater = zlib.decompressobj(-window_bits)
+    for payload in payloads:
+        if not shared:
+            inflater = zlib.decompressobj(-window_bits)
+        data, message = payload + b"\x00\x00\xff\xff", b""
+        while True:  # small pieces: back-references must fit the window
+            chunk = inflater.decompress(data, 256)
+            message += chunk
+            data = inflater.unconsumed_tail
+            if not data and len(chunk) < 256:
+                break
+        out.append(message)
+    return out
+
+
+@pytest.mark.parametrize("window_bits", [8, 10, 15])
+@pytest.mark.parametrize("no_context_takeover", [False, True])
+def test_deflate_streams(window_bits: int, no_context_takeover: bool):
+    ws = WebSocket()
+    ws._deflate_params = (window_bits, no_context_takeover)
+    # No repeats inside, so only the previous message can shorten the second;
+    # 200 bytes fit even the smallest window zlib compresses with (2**9 - 262).
+    text = b"".join(zlib.crc32(bytes([i])).to_bytes(4, "big") for i in range(50))
+    messages = [text, text, b"", BIG]
+    payloads = [ws._deflate(m) for m in messages]
+    assert not any(p.endswith(b"\x00\x00\xff\xff") for p in payloads)
+    assert inflate(payloads, window_bits, not no_context_takeover) == messages
+    if no_context_takeover:
+        assert payloads[0] == payloads[1]
+    else:
+        assert len(payloads[1]) < len(payloads[0]) / 4

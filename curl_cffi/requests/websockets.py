@@ -41,7 +41,14 @@ from time import sleep as sync_sleep
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypeVar, final
 from warnings import warn as user_warning
-from zlib import MAX_WBITS, decompressobj
+from zlib import (
+    DEFLATED,
+    MAX_WBITS,
+    Z_DEFAULT_COMPRESSION,
+    Z_SYNC_FLUSH,
+    compressobj,
+    decompressobj,
+)
 from zlib import error as ZlibError
 
 from ..aio import CURL_SOCKET_BAD, get_selector
@@ -55,6 +62,7 @@ from .utils import NOT_SET, HttpVersionLiteral, NotSetType, set_curl_options
 if TYPE_CHECKING:
     from typing import ClassVar, Final
     from weakref import ReferenceType
+    from zlib import _Compress as ZlibCompressor  # pyright: ignore[reportPrivateUsage]
     from zlib import _Decompress as ZlibDecompressor  # pyright: ignore[reportPrivateUsage]
 
     from ..const import CurlHttpVersion
@@ -88,6 +96,42 @@ CURLWS_NOAUTOPONG: Final = 1 << 1
 
 # RFC 7692 7.2.2: the sender strips this empty stored block from every message.
 _DEFLATE_TAIL: Final = b"\x00\x00\xff\xff"
+
+
+def _permessage_deflate_params(head: bytes) -> tuple[int, bool] | None:
+    """What the server's ``101`` accepted of permessage-deflate (RFC 7692).
+
+    Args:
+        head: Response headers as collected during the handshake. Earlier
+            responses (redirects, a proxy's CONNECT) may precede the ``101``.
+
+    Returns:
+        ``(client_max_window_bits, client_no_context_takeover)``, or ``None``
+        when the server did not accept the extension.
+    """
+    start: int = head.rfind(b"\r\n\r\nHTTP/", 0, max(len(head) - 4, 0))
+    block: bytes = head[start + 4 :] if start >= 0 else head
+    values: list[str] = []
+    for line in block.decode("latin-1").split("\r\n"):
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "sec-websocket-extensions":
+            values.append(value)
+    for extension in ",".join(values).split(","):
+        name, *params = (part.strip() for part in extension.split(";"))
+        if name.lower() != "permessage-deflate":
+            continue
+        window_bits: int = MAX_WBITS
+        no_context_takeover: bool = False
+        for param in params:
+            key, _, value = param.partition("=")
+            key = key.strip().lower()
+            value = value.strip().strip('"')
+            if key == "client_no_context_takeover":
+                no_context_takeover = True
+            elif key == "client_max_window_bits" and value.isdigit():
+                window_bits = min(max(int(value), 8), MAX_WBITS)
+        return window_bits, no_context_takeover
+    return None
 
 
 @dataclass
@@ -405,12 +449,15 @@ class WebSocket(BaseWebSocket):
     """A high-performance synchronous WebSocket implementation using libcurl."""
 
     __slots__: ClassVar[tuple[str, ...]] = (
+        "_deflate_params",
+        "_deflator",
         "_emitters",
         "_inflator",
         "_read_selector",
         "_recv_chunks",
         "_recv_msg_size",
         "_write_selector",
+        "compress",
         "keep_running",
     )
 
@@ -428,6 +475,7 @@ class WebSocket(BaseWebSocket):
         on_error: OnErrorType | None = None,
         ws_retry: WebSocketRetryStrategy | None = None,
         max_message_size: int = 4 * 1024 * 1024,
+        compress: bool = True,
     ) -> None:
         """
         Args:
@@ -449,6 +497,9 @@ class WebSocket(BaseWebSocket):
             on_error (OnErrorType | None, optional): Error callback.
             ws_retry (WebSocketRetryStrategy | None, optional): Retry policy.
             max_message_size (int, optional): Message size limit.
+            compress (bool, optional): Compress outgoing data messages when the
+                server accepted permessage-deflate, as browsers do. ``False``
+                sends them uncompressed, e.g. for debugging.
         """
         super().__init__(
             curl=curl,
@@ -467,6 +518,11 @@ class WebSocket(BaseWebSocket):
         # connection because the extension shares the LZ77 window between
         # messages unless the server asked for no_context_takeover.
         self._inflator: ZlibDecompressor | None = None
+        self.compress: bool = compress
+        # Window bits and client_no_context_takeover the server accepted for
+        # permessage-deflate, None when it did not; and the matching deflater.
+        self._deflate_params: tuple[int, bool] | None = None
+        self._deflator: ZlibCompressor | None = None
 
         self._emitters: dict[EventTypeLiteral, Callable[..., object]] = {}
         if on_open:
@@ -687,6 +743,8 @@ class WebSocket(BaseWebSocket):
         # Reset socket and selector cache
         self._sock_fd = -1
         self._inflator = None
+        self._deflate_params = None
+        self._deflator = None
         if self._read_selector is not None:
             self._read_selector.close()
             self._read_selector = None
@@ -697,7 +755,7 @@ class WebSocket(BaseWebSocket):
         curl: Curl = self.curl
 
         try:
-            _ = set_curl_options(
+            _, _, header_buffer, *_ = set_curl_options(
                 curl=curl,
                 method="GET",
                 url=url,
@@ -736,6 +794,7 @@ class WebSocket(BaseWebSocket):
             _ = curl.setopt(CurlOpt.CONNECT_ONLY, 2)
             _ = curl.setopt(CurlOpt.WS_OPTIONS, CURLWS_NOAUTOPONG)
             curl.perform()
+            self._deflate_params = _permessage_deflate_params(header_buffer.getvalue())
 
         except BaseException:
             # If the connection fails, don't leak the curl handle.
@@ -1047,7 +1106,8 @@ class WebSocket(BaseWebSocket):
             timeout: Max seconds to wait if the socket is blocked.
 
         Returns:
-            ``int``: The number of bytes successfully written to the socket.
+            ``int``: The number of bytes successfully written to the socket, or
+            the length of the message when it was sent compressed.
 
         Raises:
             CurlError: Network related exception occured.
@@ -1062,6 +1122,11 @@ class WebSocket(BaseWebSocket):
             Large outbound messages are seamlessly broken down into optimal
             fragments using the ``CURLWS_CONT`` flag, arriving as a single
             logical message to the server.
+
+            When the server accepted permessage-deflate, TEXT and BINARY
+            messages are compressed (RFC 7692), unless ``compress`` is off, the
+            message is sent in parts with ``CURLWS_CONT``, or ``flags`` already
+            has ``CurlWsFlag.DEFLATE`` for a payload compressed by the caller.
 
             Non-contiguous (i.e. strided) memoryviews are copied as they cannot
             be cast into a contiguous format required by ``ffi.from_buffer()``.
@@ -1085,6 +1150,50 @@ class WebSocket(BaseWebSocket):
             except TypeError:
                 payload = payload.tobytes()
 
+        if (
+            self._deflate_params is not None
+            and self.compress
+            and flags & (CurlWsFlag.TEXT | CurlWsFlag.BINARY)
+            and not flags & (CurlWsFlag.CONT | CurlWsFlag.DEFLATE)
+        ):
+            message_len: int = len(payload)
+            _ = self._send_frames(
+                self._deflate(payload), flags | CurlWsFlag.DEFLATE, timeout
+            )
+            return message_len
+        return self._send_frames(payload, flags, timeout)
+
+    def _deflate(self, payload: bytes | bytearray | memoryview) -> bytes:
+        """Compress one message for permessage-deflate (RFC 7692 7.2.1).
+
+        One deflate stream serves the whole connection, so later messages can
+        refer back to earlier ones, unless the server asked for
+        ``client_no_context_takeover``.
+        """
+        if self._deflate_params is None:
+            raise WebSocketError("permessage-deflate was not negotiated")
+        window_bits, no_context_takeover = self._deflate_params
+        deflator: ZlibCompressor | None = self._deflator
+        if deflator is None:
+            # zlib cannot compress raw deflate with 8 window bits. Like Chrome,
+            # use 9: zlib keeps back-references within 2**9 - 262 bytes, which
+            # a 2**8 window still decodes.
+            deflator = compressobj(
+                Z_DEFAULT_COMPRESSION, DEFLATED, -max(window_bits, 9)
+            )
+            self._deflator = deflator
+        data: bytes = deflator.compress(payload) + deflator.flush(Z_SYNC_FLUSH)
+        if no_context_takeover:
+            self._deflator = None
+        return data[:-4] if data.endswith(_DEFLATE_TAIL) else data
+
+    def _send_frames(
+        self,
+        payload: bytes | bytearray | memoryview,
+        flags: CurlWsFlag | int,
+        timeout: float | None,
+    ) -> int:
+        """Send one message as frames, see :meth:`send()`."""
         # Cache locals for fast path
         total_bytes: int = len(payload)
         max_frame_size: int = self._MAX_CURL_FRAME_SIZE
