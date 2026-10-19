@@ -1,0 +1,273 @@
+http: send the application's Connection: header in place, without duplicate tokens
+
+Since curl 8.16 (4d040c71d7, "Curl_http(), decomplexify") the custom
+headers skip Connection: and http_add_connection_hd() writes the first one
+after all other headers, followed by curl's own TE, Upgrade and
+HTTP2-Settings tokens without checking the value. A WebSocket handshake with
+the browser's "Connection: Upgrade" therefore sent "Connection: Upgrade,
+Upgrade" as its last line.
+
+An HTTP/1.x request now sends the first custom Connection: header where the
+application put it, as written, adding only the tokens it does not list
+(compared per token, case-insensitively). Later custom Connection: headers
+and requests without one are unchanged; the end-of-request path no longer
+duplicates tokens either.
+
+diff --git a/lib/http.c b/lib/http.c
+index 145e34b..34ff05c 100644
+--- a/lib/http.c
++++ b/lib/http.c
+@@ -216,6 +216,97 @@ static CURLcode copy_custom_value(const char *header, char **valp)
+   return CURLE_BAD_FUNCTION_ARGUMENT;
+ }
+ 
++/* curl-impersonate: TRUE if the comma-separated header value lists 'token',
++   compared case-insensitively and without the surrounding blanks. */
++static bool http_value_has_token(const char *value, const char *token)
++{
++  size_t tlen = strlen(token);
++
++  while(*value) {
++    const char *start;
++    const char *end;
++
++    while(ISBLANK(*value) || *value == ',')
++      value++;
++    start = value;
++    while(*value && *value != ',')
++      value++;
++    end = value;
++    while(end > start && ISBLANK(end[-1]))
++      end--;
++    if(((size_t)(end - start) == tlen) && curl_strnequal(start, token, tlen))
++      return TRUE;
++  }
++  return FALSE;
++}
++
++/* The request's first custom Connection: header with a value, or NULL. */
++static const struct curl_slist *http_first_connection_hd(
++  const struct Curl_easy *data)
++{
++  const struct curl_slist *head;
++
++  for(head = Curl_http_request_headers(data); head; head = head->next) {
++    if(curl_strnequal(head->data, "Connection", 10) &&
++       Curl_headersep(head->data[10]) &&
++       !http_header_is_empty(head->data))
++      return head;
++  }
++  return NULL;
++}
++
++/* Add the Connection: tokens this request needs, each one only when 'value',
++   the application's own Connection: value or NULL, does not list it yet.
++   'sep' goes before the first token added. */
++static CURLcode http_add_connection_tokens(struct Curl_easy *data,
++                                           struct dynbuf *req,
++                                           const char *value,
++                                           const char *sep)
++{
++  CURLcode result = CURLE_OK;
++
++  if(data->state.http_hd_te &&
++     !(value && http_value_has_token(value, "TE"))) {
++    result = curlx_dyn_addf(req, "%s%s", sep, "TE");
++    sep = ", ";
++  }
++  if(!result && data->state.http_hd_upgrade &&
++     !(value && http_value_has_token(value, "Upgrade"))) {
++    result = curlx_dyn_addf(req, "%s%s", sep, "Upgrade");
++    sep = ", ";
++  }
++  if(!result && data->state.http_hd_h2_settings &&
++     !(value && http_value_has_token(value, "HTTP2-Settings")))
++    result = curlx_dyn_addf(req, "%s%s", sep, "HTTP2-Settings");
++  return result;
++}
++
++/* curl-impersonate: send the application's first Connection: header where
++   it put it among the custom headers, as it wrote it, plus the tokens the
++   request needs that it does not list. */
++static CURLcode http_add_first_connection_hd(struct Curl_easy *data,
++                                             struct dynbuf *req,
++                                             const char *line)
++{
++  size_t len = strlen(line);
++  char *value;
++  CURLcode result = copy_custom_value(line, &value);
++
++  if(result)
++    return result;
++  while(len && ISBLANK(line[len - 1]))
++    len--;
++  result = curlx_dyn_addn(req, line, len);
++  if(!result)
++    result = http_add_connection_tokens(data, req, value, ", ");
++  if(!result)
++    result = curlx_dyn_addn(req, STRCONST("\r\n"));
++  curlx_free(value);
++  if(!result)
++    data->state.http_hd_connection = TRUE;
++  return result;
++}
++
+ /*
+  * Strip off leading and trailing whitespace from the value in the given HTTP
+  * header line and return a strdup-ed copy in 'valp' - returns an empty
+@@ -1786,9 +1877,13 @@ static bool http_merged_user_agent_is_firefox(struct Curl_easy *data)
+   return uagent && strstr(&uagent[10], "Firefox/") != NULL;
+ }
+ 
+-CURLcode Curl_add_custom_headers(struct Curl_easy *data,
+-                                 bool is_connect, int httpversion,
+-                                 struct dynbuf *req)
++/* 'first_conn' is the custom Connection: header to send in place, see
++   http_add_first_connection_hd(), or NULL to leave them all to
++   http_add_connection_hd(). */
++static CURLcode http_add_custom_hds(struct Curl_easy *data,
++                                    bool is_connect, int httpversion,
++                                    struct dynbuf *req,
++                                    const struct curl_slist *first_conn)
+ {
+   struct curl_slist *h[2];
+   struct curl_slist *headers;
+@@ -1900,9 +1995,11 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
+                  we will force length zero then */
+               curlx_str_casecompare(&name, "Content-Length"))
+         ;
+-      else if(curlx_str_casecompare(&name, "Connection"))
++      else if(curlx_str_casecompare(&name, "Connection")) {
+         /* Connection headers are handled specially */
+-        ;
++        if(headers == first_conn)
++          result = http_add_first_connection_hd(data, req, origp);
++      }
+       /* curl-impersonate: Firefox sends Priority on HTTP/1.x; omit it for
+          other User-Agents. */
+       else if((httpversion < 20) &&
+@@ -1935,6 +2032,13 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
+   return CURLE_OK;
+ }
+ 
++CURLcode Curl_add_custom_headers(struct Curl_easy *data,
++                                 bool is_connect, int httpversion,
++                                 struct dynbuf *req)
++{
++  return http_add_custom_hds(data, is_connect, httpversion, req, NULL);
++}
++
+ #ifndef CURL_DISABLE_PARSEDATE
+ CURLcode Curl_add_timecondition(struct Curl_easy *data,
+                                 struct dynbuf *req)
+@@ -3229,55 +3333,37 @@ static CURLcode http_check_new_conn(struct Curl_easy *data)
+ static CURLcode http_add_connection_hd(struct Curl_easy *data,
+                                        struct dynbuf *req)
+ {
+-  struct curl_slist *head;
+-  const char *sep = "Connection: ";
++  const struct curl_slist *first = http_first_connection_hd(data);
++  const struct curl_slist *head;
+   CURLcode result = CURLE_OK;
+-  size_t rlen = curlx_dyn_len(req);
+-  bool skip;
+ 
+-  /* Add the 1st custom "Connection: " header, if there is one */
+-  for(head = Curl_http_request_headers(data); head; head = head->next) {
+-    if(curl_strnequal(head->data, "Connection", 10) &&
+-       Curl_headersep(head->data[10]) &&
+-       !http_header_is_empty(head->data)) {
+-      char *value;
+-      result = copy_custom_value(head->data, &value);
+-      if(result)
+-        return result;
+-      result = curlx_dyn_addf(req, "%s%s", sep, value);
+-      sep = ", ";
+-      curlx_free(value);
+-      break; /* leave, having added 1st one */
+-    }
+-  }
++  /* Add the 1st custom "Connection: " header, if there is one, with our
++     internal Connection: header values that it does not list yet - unless
++     it was already sent with the custom headers */
++  if(!data->state.http_hd_connection) {
++    size_t rlen = curlx_dyn_len(req);
++    char *value = NULL;
+ 
+-  /* add our internal Connection: header values, if we have any */
+-  if(!result && data->state.http_hd_te) {
+-    result = curlx_dyn_addf(req, "%s%s", sep, "TE");
+-    sep = ", ";
+-  }
+-  if(!result && data->state.http_hd_upgrade) {
+-    result = curlx_dyn_addf(req, "%s%s", sep, "Upgrade");
+-    sep = ", ";
+-  }
+-  if(!result && data->state.http_hd_h2_settings) {
+-    result = curlx_dyn_addf(req, "%s%s", sep, "HTTP2-Settings");
++    if(first) {
++      result = copy_custom_value(first->data, &value);
++      if(!result)
++        result = curlx_dyn_addf(req, "Connection: %s", value);
++    }
++    if(!result)
++      result = http_add_connection_tokens(data, req, value,
++                                          first ? ", " : "Connection: ");
++    curlx_free(value);
++    if(!result && (rlen < curlx_dyn_len(req)))
++      result = curlx_dyn_addn(req, STRCONST("\r\n"));
++    if(result)
++      return result;
+   }
+-  if(!result && (rlen < curlx_dyn_len(req)))
+-    result = curlx_dyn_addn(req, STRCONST("\r\n"));
+-  if(result)
+-    return result;
+ 
+   /* Add all user-defined Connection: headers after the first */
+-  skip = TRUE;
+-  for(head = Curl_http_request_headers(data); head; head = head->next) {
++  for(head = first ? first->next : NULL; head; head = head->next) {
+     if(curl_strnequal(head->data, "Connection", 10) &&
+        Curl_headersep(head->data[10]) &&
+        !http_header_is_empty(head->data)) {
+-      if(skip) {
+-        skip = FALSE;
+-        continue;
+-      }
+       result = curlx_dyn_addf(req, "%s\r\n", head->data);
+       if(result)
+         return result;
+@@ -3447,7 +3533,11 @@ static CURLcode http_add_hd(struct Curl_easy *data,
+     break;
+ 
+   case H1_HD_CUSTOM:
+-    result = Curl_add_custom_headers(data, FALSE, httpversion, req);
++    /* curl-impersonate: an HTTP/1.x request sends the application's own
++       Connection: where it put it */
++    result = http_add_custom_hds(data, FALSE, httpversion, req,
++                                 (httpversion < 20) ?
++                                 http_first_connection_hd(data) : NULL);
+     break;
+ 
+   case H1_HD_CONTENT:
+@@ -3507,6 +3597,7 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
+   data->state.http_hd_te = FALSE;
+   data->state.http_hd_upgrade = FALSE;
+   data->state.http_hd_h2_settings = FALSE;
++  data->state.http_hd_connection = FALSE;
+ 
+   /* what kind of request do we need to send? */
+   Curl_http_method(data, &method, &httpreq);
+diff --git a/lib/urldata.h b/lib/urldata.h
+index 0fd5fde..d137a26 100644
+--- a/lib/urldata.h
++++ b/lib/urldata.h
+@@ -697,6 +697,7 @@ struct UrlState {
+   BIT(http_hd_te); /* Added HTTP header TE: */
+   BIT(http_hd_upgrade); /* Added HTTP header Upgrade: */
+   BIT(http_hd_h2_settings); /* Added HTTP header H2Settings: */
++  BIT(http_hd_connection); /* Sent the 1st custom Connection: in place */
+   BIT(maybe_folded);
+   BIT(leading_unfold); /* unfold started, this is the leading bytes */
+ #endif
