@@ -1,0 +1,334 @@
+conn: lay out client Initial packets like Chrome's chaos protection
+
+Chrome (quiche's QuicChaosProtector) splits the CRYPTO data of an Initial
+packet at random, adds PING frames, spreads the padding over the packet as
+several PADDING frames and shuffles all frames, so the packet does not end
+with one block of padding. A ClientHello needing two packets is shared out
+first (QuicPacketCreator::MultiPacketChaosProtect): the first packet carries
+its first 55 to 86 bytes and its end, the second the middle, and both about
+as much padding. The packets stay as large as before; 0-RTT packets no
+longer share the datagram of an Initial packet, as with Chrome.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 7291a16..0b61b1d 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -2268,17 +2268,134 @@ static int conn_cut_crypto_frame(ngtcp2_conn *conn, ngtcp2_frame_chain *frc,
+   return 0;
+ }
+ 
++/* curl-impersonate: the size of a CRYPTO frame header, quiche's
++   QuicFramer::GetMinCryptoFrameSize(). */
++static size_t crypto_frame_overhead(uint64_t offset, uint64_t len) {
++  return 1 + ngtcp2_put_uvarintlen(offset) + ngtcp2_put_uvarintlen(len);
++}
++
++/*
++ * curl-impersonate: conn_chaos_protect lays out an Initial packet like
++ * Chrome's chaos protection (quiche's QuicChaosProtector).  The
++ * |datacnt| CRYPTO frames in |data| and |offsets| leave |padding| bytes
++ * of the packet.  2 to 10 times a random frame is split at a random
++ * point while the padding pays for the frame headers, 2 to 10 PING
++ * frames are added, a random part of the remaining padding goes before
++ * each frame as a PADDING frame and the rest after the last one, and
++ * all frames are shuffled.  A PING frame is {NULL, 0}, a PADDING frame
++ * {NULL, length}.  This function returns the number of frames.
++ */
++static size_t conn_chaos_protect(ngtcp2_conn *conn, ngtcp2_vec *data,
++                                 uint64_t *offsets, size_t datacnt,
++                                 size_t padding) {
++  ngtcp2_vec frames[64];
++  uint64_t frame_offsets[64];
++  uint64_t begin = UINT64_MAX, end = 0, o;
++  size_t max_overhead, overhead, len, n, i, j;
++  ngtcp2_vec v;
++
++  if (padding == 0 || datacnt > 32) {
++    return datacnt;
++  }
++
++  for (i = 0; i < datacnt; ++i) {
++    begin = ngtcp2_min_uint64(begin, offsets[i]);
++    end = ngtcp2_max_uint64(end, offsets[i] + data[i].len);
++  }
++
++  /* SplitCryptoFrame */
++  max_overhead = crypto_frame_overhead(end, end - begin);
++  n = 2 + ngtcp2_pcg32_rand_n(&conn->pcg, 9);
++  for (j = 0; j < n && padding >= max_overhead; ++j) {
++    i = ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)datacnt);
++    if (data[i].len <= 1) {
++      continue;
++    }
++
++    overhead = crypto_frame_overhead(offsets[i], data[i].len);
++    len = 1 + ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)(data[i].len - 1));
++    data[datacnt] = (ngtcp2_vec){
++      .base = data[i].base + len,
++      .len = data[i].len - len,
++    };
++    offsets[datacnt] = offsets[i] + len;
++    data[i].len = len;
++    padding = padding + overhead -
++              crypto_frame_overhead(offsets[i], data[i].len) -
++              crypto_frame_overhead(offsets[datacnt], data[datacnt].len);
++    ++datacnt;
++  }
++
++  /* AddPingFrames */
++  if (padding) {
++    n = ngtcp2_min_size(2 + ngtcp2_pcg32_rand_n(&conn->pcg, 9), padding);
++    for (j = 0; j < n; ++j) {
++      data[datacnt] = (ngtcp2_vec){
++        .base = NULL,
++        .len = 0,
++      };
++      offsets[datacnt++] = 0;
++    }
++    padding -= n;
++  }
++
++  /* SpreadPadding */
++  memcpy(frames, data, sizeof(frames[0]) * datacnt);
++  memcpy(frame_offsets, offsets, sizeof(frame_offsets[0]) * datacnt);
++  n = datacnt;
++  datacnt = 0;
++  for (i = 0; i < n; ++i) {
++    len = ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)(padding + 1));
++    if (len) {
++      data[datacnt] = (ngtcp2_vec){
++        .base = NULL,
++        .len = len,
++      };
++      offsets[datacnt++] = 0;
++      padding -= len;
++    }
++    data[datacnt] = frames[i];
++    offsets[datacnt++] = frame_offsets[i];
++  }
++  if (padding) {
++    data[datacnt] = (ngtcp2_vec){
++      .base = NULL,
++      .len = padding,
++    };
++    offsets[datacnt++] = 0;
++  }
++
++  /* ReorderFrames */
++  for (i = datacnt - 1; i > 0; --i) {
++    j = ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)(i + 1));
++    v = data[i];
++    data[i] = data[j];
++    data[j] = v;
++    o = offsets[i];
++    offsets[i] = offsets[j];
++    offsets[j] = o;
++  }
++
++  return datacnt;
++}
++
+ /*
+- * conn_crumble_initial_crypto splits CRYPTO frame (*pfrc)->fr.stream
+- * into pieces and adds PADDING and PING frames, and reorder those
+- * frames.  Those frames are encoded in the buffer pointed by |data|
+- * and |offsets|.  |data| is the pointer to the array of ngtcp2_vec of
+- * at least NGTCP2_MAX_STREAM_DATACNT.  |offsets| contains the CRYPTO
+- * offset of the corresponding ngtcp2_vec in |data|, and it also
+- * should have the capacity at least NGTCP2_MAX_STREAM_DATACNT
+- * uint64_t.  |left| is the number of bytes available for the current
+- * packet.  |crypto_offset| is the next smallest CRYPTO offset.
+- * |crypto_strm| is the CRYPTO stream.
++ * conn_crumble_initial_crypto takes the CRYPTO data for the current
++ * Initial packet and lays the packet out like Chrome: frames are
++ * encoded in the buffer pointed by |data| and |offsets|.  |data| is the
++ * pointer to the array of ngtcp2_vec of at least
++ * NGTCP2_MAX_STREAM_DATACNT.  |offsets| contains the CRYPTO offset of
++ * the corresponding ngtcp2_vec in |data|, and it also should have the
++ * capacity at least NGTCP2_MAX_STREAM_DATACNT uint64_t.  |left| is the
++ * number of bytes available for the current packet.  |crypto_offset|
++ * is the next smallest CRYPTO offset.  |crypto_strm| is the CRYPTO
++ * stream.
++ *
++ * curl-impersonate: a ClientHello needing several packets is shared
++ * out as by quiche's QuicPacketCreator::MultiPacketChaosProtect: the
++ * first packet carries its first 55 to 86 bytes and its end, the next
++ * ones the middle, and each about as much data.  conn_chaos_protect
++ * then fills the rest of the packet.
+  *
+  * This function returns the number of objects written to |data| and
+  * |offsets|, or one of the following negative error codes:
+@@ -2291,92 +2408,116 @@ conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
+                             ngtcp2_vec *data, uint64_t *offsets,
+                             ngtcp2_strm *crypto_strm, size_t left,
+                             uint64_t crypto_offset) {
+-  ngtcp2_vec server_name;
++  ngtcp2_frame_chain *frc;
+   ngtcp2_vec removed_data;
+-  size_t max_add_frames = 10;
+-  size_t single_crypto_overhead =
+-    1 + ngtcp2_put_uvarintlen(crypto_offset + left - 1) +
+-    ngtcp2_put_uvarintlen(left);
+-  size_t total_crypto_overhead = single_crypto_overhead * max_add_frames;
+-  size_t datacnt;
++  size_t datalen, total, used, min_overhead, room, npkts, pkt_datalen;
++  size_t first_len, last_len;
++  size_t datacnt = 1;
+   size_t i;
+   int rv;
+ 
+-  if (left <= total_crypto_overhead) {
++  datalen = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
++  if (datalen == (size_t)-1) {
+     return 0;
+   }
+ 
+-  left -= total_crypto_overhead;
+-
+-  left = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
+-  if (left == (size_t)-1) {
+-    return 0;
+-  }
+-
+-  rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc, left);
++  rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc,
++                                 crypto_offset == 0 ? SIZE_MAX : datalen);
+   if (rv != 0) {
+     assert(ngtcp2_err_is_fatal(rv));
+     return rv;
+   }
+ 
+-  if (*pfrc == NULL) {
++  frc = *pfrc;
++  if (frc == NULL) {
+     return 0;
+   }
+ 
+-  assert(crypto_offset == (*pfrc)->fr.stream.offset);
+-
+-  ngtcp2_vec_copy(data, (*pfrc)->fr.stream.data, (*pfrc)->fr.stream.datacnt);
+-  datacnt = (*pfrc)->fr.stream.datacnt;
++  assert(crypto_offset == frc->fr.stream.offset);
++
++  total = (size_t)ngtcp2_vec_len(frc->fr.stream.data, frc->fr.stream.datacnt);
++  data[0] = frc->fr.stream.data[0];
++  offsets[0] = crypto_offset;
++
++  if (crypto_offset == 0 && frc->fr.stream.datacnt == 1) {
++    min_overhead = crypto_frame_overhead(total - 1, total);
++    if (left > 2 * min_overhead && total > left - 2 * min_overhead) {
++      /* The first packet has two CRYPTO frames, the others one. */
++      room = left - min_overhead;
++      npkts = (total + min_overhead + room - 1) / room;
++      pkt_datalen = (total + min_overhead + npkts - 1) / npkts;
++      first_len = 55 + ngtcp2_pcg32_rand_n(&conn->pcg, 32);
++      if (total > first_len && pkt_datalen > min_overhead + first_len) {
++        last_len = pkt_datalen - min_overhead - first_len;
++        removed_data = (ngtcp2_vec){
++          .base = data[0].base + first_len,
++          .len = total - first_len - last_len,
++        };
++
++        rv = conn_cut_crypto_frame(conn, frc, crypto_strm, &removed_data);
++        if (rv != 0) {
++          ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc,
++                                          conn->mem);
++          return rv;
++        }
+ 
+-  offsets[0] = (*pfrc)->fr.stream.offset;
++        assert(frc->next);
+ 
+-  for (i = 1; i < datacnt; ++i) {
+-    offsets[i] = offsets[i - 1] + data[i - 1].len;
++        data[0] = frc->fr.stream.data[0];
++        data[1] = frc->next->fr.stream.data[0];
++        offsets[1] = frc->next->fr.stream.offset;
++        datacnt = 2;
++      }
++    }
+   }
+ 
+-  if (datacnt < NGTCP2_MAX_STREAM_DATACNT &&
+-      ngtcp2_pkt_find_server_name(&server_name, data) && server_name.len > 1) {
+-    if (ngtcp2_strm_streamfrq_empty(crypto_strm) ||
+-        ngtcp2_strm_streamfrq_unacked_offset(crypto_strm) == (uint64_t)-1) {
+-      datacnt = ngtcp2_pkt_split_vec_at(
+-        data, datacnt, offsets,
+-        (size_t)(server_name.base - data[0].base) + server_name.len / 2);
+-    } else {
+-      /* If we have another data to send (most likely in the another
+-         packet), remove the part of SNI from this packet. */
+-      datacnt = ngtcp2_pkt_remove_vec_partial(
+-        &removed_data, data, datacnt, offsets, &conn->pcg, &server_name);
++  /* What does not fit in this packet goes back to the queue. */
++  if (datacnt == 2) {
++    /* shared out above */
++  } else if (frc->fr.stream.datacnt > 1) {
++    datalen = ngtcp2_min_size(datalen, frc->fr.stream.data[0].len);
+ 
+-      rv = conn_cut_crypto_frame(conn, *pfrc, crypto_strm, &removed_data);
+-      if (rv != 0) {
+-        ngtcp2_frame_chain_objalloc_del(*pfrc, &conn->frc_objalloc, conn->mem);
+-        return rv;
+-      }
++    rv = ngtcp2_strm_streamfrq_push(crypto_strm, frc);
++    if (rv != 0) {
++      ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc, conn->mem);
++      return rv;
++    }
+ 
+-      /* Add the length of removed data to total_crypto_overhead so
+-         that we can use them for inter CRYPTO frames padding. */
+-      total_crypto_overhead += removed_data.len;
++    rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc, datalen);
++    if (rv != 0) {
++      assert(ngtcp2_err_is_fatal(rv));
++      return rv;
+     }
+-  }
+ 
+-  if (datacnt < max_add_frames + 1) {
+-    max_add_frames -= datacnt - 1;
++    frc = *pfrc;
++    assert(frc);
++    assert(frc->fr.stream.datacnt == 1);
+ 
+-    datacnt = ngtcp2_pkt_split_vec_rand(data, datacnt, offsets, &conn->pcg,
+-                                        max_add_frames);
+-  }
++    data[0] = frc->fr.stream.data[0];
++  } else if (total > datalen) {
++    removed_data = (ngtcp2_vec){
++      .base = data[0].base + datalen,
++      .len = total - datalen,
++    };
+ 
+-  for (i = 1; i < datacnt; ++i) {
+-    total_crypto_overhead -= 1 + ngtcp2_put_uvarintlen(offsets[i]) +
+-                             ngtcp2_put_uvarintlen(data[i].len);
++    rv = conn_cut_crypto_frame(conn, frc, crypto_strm, &removed_data);
++    if (rv != 0) {
++      ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc, conn->mem);
++      return rv;
++    }
++
++    data[0].len = datalen;
+   }
+ 
+-  datacnt = ngtcp2_pkt_append_ping_and_padding(data, datacnt, &conn->pcg,
+-                                               total_crypto_overhead);
++  used = 0;
++  for (i = 0; i < datacnt; ++i) {
++    used += crypto_frame_overhead(offsets[i], data[i].len) + data[i].len;
++  }
+ 
+-  ngtcp2_pkt_permutate_vec(data, datacnt, offsets, &conn->pcg);
++  assert(used <= left);
+ 
+-  return (ngtcp2_ssize)datacnt;
++  return (ngtcp2_ssize)conn_chaos_protect(conn, data, offsets, datacnt,
++                                          left - used);
+ }
+ 
+ static size_t conn_dgram_padding(ngtcp2_conn *conn, ngtcp2_ppe *ppe) {
