@@ -1,0 +1,157 @@
+http2: HEADERS priority from the request's priority header, like Chrome
+
+Chrome gives a request of priority p (the u=p of its "priority" header) the
+HTTP/2 weight round(1 + (7 - p) * 255 / 7), sets the exclusive bit and makes
+the stream depend on the newest stream still open with the same or a higher
+priority, else on 0. curl-impersonate sent weight 256 and dependency 0 for
+every request.
+
+For profiles with Chrome's exclusive priorities, a request with a priority
+header now gets that weight and dependency. A CURLOPT_STREAM_WEIGHT set by
+the application keeps its weight: it is told apart from the profile's own
+setting by a new stream_weight_set bit. Requests without the header keep
+the profile's priority and count as priority 0 for later streams. PRIORITY
+frames and HTTP/3 are unchanged.
+
+diff --git a/lib/easy.c b/lib/easy.c
+index 3277e1f..beb0bf5 100644
+--- a/lib/easy.c
++++ b/lib/easy.c
+@@ -657,6 +657,8 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
+     ret = curl_easy_setopt(data, CURLOPT_STREAM_WEIGHT, opts->http2_stream_weight);
+     if(ret)
+       return ret;
++    /* the profile's weight is a default, not the application's choice */
++    data->set.stream_weight_set = FALSE;
+   }
+ 
+   if(opts->http2_stream_exclusive) {
+diff --git a/lib/http2.c b/lib/http2.c
+index 5262643..e4b9724 100644
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -140,6 +140,7 @@ struct h2_stream_ctx {
+   CURLcode xfer_result; /* Result of writing out response */
+   int32_t local_window_size; /* the local recv window size */
+   int32_t id; /* HTTP/2 protocol identifier for stream */
++  uint8_t prio; /* curl-impersonate: request priority 0-7, 0 is highest */
+   BIT(resp_hds_complete); /* we have a complete, final response */
+   BIT(closed); /* TRUE on stream close */
+   BIT(reset);  /* TRUE on stream reset */
+@@ -1955,6 +1956,80 @@ static void h2_pri_spec(struct Curl_easy *data,
+   data->state.stream_exclusive = data->set.stream_exclusive;
+ }
+ 
++/* curl-impersonate: the urgency (RFC 9218) of a "priority" header value, 3
++   when it has none or an invalid one. */
++static int h2_priority_urgency(const char *value, size_t len)
++{
++  const char *end = value + len;
++  int urgency = 3;
++
++  while(value < end) {
++    const char *key;
++
++    while(value < end && (ISBLANK(*value) || *value == ','))
++      value++;
++    key = value;
++    while(value < end && *value != '=' && *value != ',' && *value != ';')
++      value++;
++    if(((value - key) == 1) && (*key == 'u') && ((end - value) >= 2) &&
++       (*value == '=') && ISDIGIT(value[1]) && (value[1] <= '7') &&
++       (((end - value) == 2) || !ISDIGIT(value[2])))
++      urgency = value[1] - '0';
++    while(value < end && *value != ',')
++      value++;
++  }
++  return urgency;
++}
++
++struct h2_open_stream_search {
++  int32_t id; /* newest match so far, 0 for none */
++  uint8_t prio; /* lowest priority to match */
++};
++
++static bool h2_find_open_stream(uint32_t mid, void *value, void *user_data)
++{
++  const struct h2_stream_ctx *stream = value;
++  struct h2_open_stream_search *search = user_data;
++
++  (void)mid;
++  if((stream->id > search->id) && !stream->closed &&
++     (stream->prio <= search->prio))
++    search->id = stream->id;
++  return TRUE;
++}
++
++/* curl-impersonate: Chrome sets the HEADERS priority from the request's
++ * priority p, which its "priority: u=p" header carries: the weight is
++ * round(1 + (7 - p) * 255 / 7) and the stream depends exclusively on the
++ * newest stream still open with the same or a higher priority, else on 0.
++ * A CURLOPT_STREAM_WEIGHT set by the application keeps its weight. A
++ * request without the header keeps the profile's priority and counts as
++ * priority 0 for the streams after it. Only profiles with Chrome's
++ * exclusive priorities do this. */
++static void h2_pri_spec_from_header(struct cf_h2_ctx *ctx,
++                                    struct Curl_easy *data,
++                                    struct h2_stream_ctx *stream,
++                                    struct dynhds *h2_headers,
++                                    nghttp2_priority_spec *pri_spec)
++{
++  static const int weights[8] = { 256, 220, 183, 147, 110, 74, 37, 1 };
++  struct h2_open_stream_search search;
++  struct dynhds_entry *e;
++
++  if(!data->set.stream_exclusive || data->set.http2_no_priority)
++    return;
++  e = Curl_dynhds_cget(h2_headers, "priority");
++  if(!e)
++    return;
++  stream->prio = (uint8_t)h2_priority_urgency(e->value, e->valuelen);
++  search.id = 0;
++  search.prio = stream->prio;
++  Curl_uint32_hash_visit(&ctx->streams, h2_find_open_stream, &search);
++  nghttp2_priority_spec_init(pri_spec, search.id,
++                             data->set.stream_weight_set ?
++                             data->set.weight : weights[stream->prio], 1);
++}
++
+ /*
+  * Check if there is been an update in the priority /
+  * dependency settings and if so it submits a PRIORITY frame with the updated
+@@ -2289,6 +2364,7 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
+   }
+ 
+   h2_pri_spec(data, &pri_spec);
++  h2_pri_spec_from_header(ctx, data, stream, &h2_headers, &pri_spec);
+   if(!nghttp2_session_check_request_allowed(ctx->h2))
+     CURL_TRC_CF(data, cf, "send request NOT allowed (via nghttp2)");
+ 
+diff --git a/lib/setopt.c b/lib/setopt.c
+index 0838e64..32738b3 100644
+--- a/lib/setopt.c
++++ b/lib/setopt.c
+@@ -1243,8 +1243,10 @@ static CURLcode setopt_long_http(struct Curl_easy *data, CURLoption option,
+     break;
+   case CURLOPT_STREAM_WEIGHT:
+ #if defined(USE_HTTP2) || defined(USE_HTTP3)
+-    if((arg >= 1) && (arg <= 256))
++    if((arg >= 1) && (arg <= 256)) {
+       s->weight = (int)arg;
++      s->stream_weight_set = TRUE;
++    }
+     break;
+ #else
+     result = CURLE_NOT_BUILT_IN;
+diff --git a/lib/urldata.h b/lib/urldata.h
+index d137a26..ebb4882 100644
+--- a/lib/urldata.h
++++ b/lib/urldata.h
+@@ -1203,6 +1203,7 @@ struct UserDefined {
+   BIT(tls_grease_sigalgs);
+   BIT(http2_no_priority);
+   BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
++  BIT(stream_weight_set); /* CURLOPT_STREAM_WEIGHT set by the application */
+   BIT(post301); /* keep POSTs as POSTs after a 301 request */
+   BIT(post302); /* keep POSTs as POSTs after a 302 request */
+   BIT(post303); /* keep POSTs as POSTs after a 303 request */
