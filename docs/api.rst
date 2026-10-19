@@ -52,6 +52,15 @@ CurlMime
    .. automethod:: attach
    .. automethod:: close
 
+CurlShare
+~~~~~~
+
+.. autoclass:: curl_cffi.CurlShare
+
+   .. automethod:: __init__
+   .. automethod:: setopt
+   .. automethod:: close
+
 Constants
 ~~~~~~~~~
 
@@ -65,6 +74,9 @@ Enum values used by ``setopt`` and ``getinfo`` can be accessed from ``CurlOpt`` 
 .. autoclass:: curl_cffi.CurlHttpVersion
 .. autoclass:: curl_cffi.CurlWsFlag
 .. autoclass:: curl_cffi.CurlSslVersion
+.. autoclass:: curl_cffi.CurlShOpt
+.. autoclass:: curl_cffi.CurlLockData
+.. autoclass:: curl_cffi.CurlShECode
 
 requests-like API
 -----------------

@@ -63,6 +63,48 @@ with open(CONST_FILE, "w") as f:
     f.write(clean_output(output))
     f.write("\n\n")
 
+    f.write(
+        '''class CurlShOpt(IntEnum):
+    """``CURLSHOPT_`` constants from libcurl,
+    see: https://curl.se/libcurl/c/curl_share_setopt.html"""
+
+    NONE = 0
+    SHARE = 1
+    UNSHARE = 2
+    LOCKFUNC = 3
+    UNLOCKFUNC = 4
+    USERDATA = 5
+
+
+class CurlLockData(IntEnum):
+    """``CURL_LOCK_DATA_`` constants from libcurl, the kinds of data a share
+    handle can hold, see: https://curl.se/libcurl/c/curl_share_setopt.html"""
+
+    NONE = 0
+    SHARE = 1
+    COOKIE = 2
+    DNS = 3
+    SSL_SESSION = 4
+    CONNECT = 5
+    PSL = 6
+    HSTS = 7
+
+
+class CurlShECode(IntEnum):
+    """``CURLSHE_`` return codes of the share interface from libcurl,
+    see: https://curl.se/libcurl/c/libcurl-errors.html"""
+
+    OK = 0
+    BAD_OPTION = 1
+    IN_USE = 2
+    INVALID = 3
+    NOMEM = 4
+    NOT_BUILT_IN = 5
+
+
+'''
+    )
+
     f.write("class CurlECode(IntEnum):\n")
     f.write('    """``CURLECODE_`` constancs extracted from libcurl,\n')
     f.write('    see: https://curl.se/libcurl/c/libcurl-errors.html"""\n\n')

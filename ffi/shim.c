@@ -25,3 +25,76 @@ int _curl_easy_getinfo_socket(void* curl, int option, uintptr_t* result) {
     }
     return (int)ret;
 }
+
+// Locks for a share handle, one mutex per kind of shared data. libcurl calls
+// them from whatever thread runs a transfer, so they must not need the GIL.
+#ifdef _WIN32
+#include <windows.h>
+typedef CRITICAL_SECTION share_mutex;
+#define share_mutex_init(m) InitializeCriticalSection(m)
+#define share_mutex_destroy(m) DeleteCriticalSection(m)
+#define share_mutex_lock(m) EnterCriticalSection(m)
+#define share_mutex_unlock(m) LeaveCriticalSection(m)
+#else
+#include <pthread.h>
+typedef pthread_mutex_t share_mutex;
+#define share_mutex_init(m) pthread_mutex_init(m, NULL)
+#define share_mutex_destroy(m) pthread_mutex_destroy(m)
+#define share_mutex_lock(m) pthread_mutex_lock(m)
+#define share_mutex_unlock(m) pthread_mutex_unlock(m)
+#endif
+
+struct share_locks {
+    share_mutex mutex[CURL_LOCK_DATA_LAST];
+};
+
+static void share_lock(CURL* handle, curl_lock_data data,
+                       curl_lock_access access, void* userptr) {
+    struct share_locks* locks = userptr;
+    (void)handle;
+    (void)access;
+    if ((unsigned)data < CURL_LOCK_DATA_LAST) {
+        share_mutex_lock(&locks->mutex[data]);
+    }
+}
+
+static void share_unlock(CURL* handle, curl_lock_data data, void* userptr) {
+    struct share_locks* locks = userptr;
+    (void)handle;
+    if ((unsigned)data < CURL_LOCK_DATA_LAST) {
+        share_mutex_unlock(&locks->mutex[data]);
+    }
+}
+
+void* _curl_share_locks_new(void) {
+    struct share_locks* locks = malloc(sizeof(*locks));
+    int i;
+    if (locks) {
+        for (i = 0; i < CURL_LOCK_DATA_LAST; i++) {
+            share_mutex_init(&locks->mutex[i]);
+        }
+    }
+    return locks;
+}
+
+void _curl_share_locks_free(void* ptr) {
+    struct share_locks* locks = ptr;
+    int i;
+    if (locks) {
+        for (i = 0; i < CURL_LOCK_DATA_LAST; i++) {
+            share_mutex_destroy(&locks->mutex[i]);
+        }
+        free(locks);
+    }
+}
+
+int _curl_share_setopt_locks(void* share, void* locks) {
+    CURLSHcode ret = curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock);
+    if (ret == CURLSHE_OK) {
+        ret = curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock);
+    }
+    if (ret == CURLSHE_OK) {
+        ret = curl_share_setopt(share, CURLSHOPT_USERDATA, locks);
+    }
+    return (int)ret;
+}

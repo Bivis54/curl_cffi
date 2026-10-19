@@ -7,6 +7,8 @@ import ssl
 import struct
 import sys
 import warnings
+from collections.abc import Iterable
+from contextlib import suppress
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -14,7 +16,16 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import certifi
 
 from ._wrapper import ffi, lib
-from .const import CurlECode, CurlHttpVersion, CurlInfo, CurlOpt, CurlWsFlag
+from .const import (
+    CurlECode,
+    CurlHttpVersion,
+    CurlInfo,
+    CurlLockData,
+    CurlOpt,
+    CurlShECode,
+    CurlShOpt,
+    CurlWsFlag,
+)
 from .utils import CurlCffiWarning
 
 
@@ -275,6 +286,7 @@ class Curl:
         self._ws_headers = ffi.NULL
         self._proxy_headers = ffi.NULL
         self._resolve = ffi.NULL
+        self._share: CurlShare | None = None
         self._cacert = cacert or DEFAULT_CACERT
         self._is_cert_set = False
         self._skip_cacert = False
@@ -418,6 +430,15 @@ class Curl:
             self._debug_handle = c_value
             lib._curl_easy_setopt(self._curl, CurlOpt.DEBUGFUNCTION, lib.debug_function)
             option = CurlOpt.DEBUGDATA
+        elif option == CurlOpt.SHARE:
+            if value is None:
+                c_value = ffi.NULL
+            elif isinstance(value, CurlShare):
+                c_value = value._handle()
+            else:
+                raise TypeError(
+                    f"CurlOpt.SHARE needs a CurlShare or None, not {value!r}"
+                )
         elif value_type == "char*":
             if isinstance(value, str):
                 # Windows/libcurl expects ANSI code page for file paths (char*).
@@ -483,6 +504,10 @@ class Curl:
 
         if option == CurlOpt.CAINFO:
             self._is_cert_set = True
+        elif option == CurlOpt.SHARE:
+            # libcurl keeps using the share until the handle is closed, even
+            # across curl_easy_reset(), so it has to outlive the handle.
+            self._share = value
 
         return ret
 
@@ -716,6 +741,7 @@ class Curl:
             # connections; their contexts are released afterwards.
             lib.curl_easy_cleanup(self._curl)
             self._curl = None
+        self._share = None
         self.clean_handles_and_buffers()
         self._debug_handle = None
         ffi.release(self._error_buffer)
@@ -807,6 +833,114 @@ class Curl:
         """
         payload = struct.pack("!H", code) + message
         return self.ws_send(payload, flags=CurlWsFlag.CLOSE)
+
+
+class CurlShare:
+    """Wrapper for the ``curl_share_`` API: data that curl handles keep in
+    common.
+
+    By default a share holds the TLS session cache. A handle attached to it
+    stores the sessions (TLS 1.2 session tickets, TLS 1.3 PSKs) its
+    connections get, and a new connection of any attached handle to the same
+    host resumes one, as a browser does when it reconnects. Closing a handle
+    leaves its sessions in the share. Attach a share with
+    ``Curl.setopt(CurlOpt.SHARE, share)``, ``Session(share=share)``,
+    ``AsyncSession(share=share)`` or ``WebSocket(share=share)``.
+
+    Use one share per browser identity, e.g. per account: connections that
+    resume each other's sessions are linked for the server, so sharing one
+    cache between accounts would tie them together.
+
+    Locking is done in C with one mutex per kind of shared data, so the
+    handles may run in different threads.
+
+    .. code-block:: python
+
+        from curl_cffi import CurlShare, WebSocket
+
+        with CurlShare() as share:
+            ws = WebSocket(share=share).connect("wss://example.com/ws")
+            ws.terminate()
+            # resumes the TLS session of the first connection
+            ws = WebSocket(share=share).connect("wss://example.com/ws")
+    """
+
+    def __init__(
+        self, data: Iterable[CurlLockData | int] = (CurlLockData.SSL_SESSION,)
+    ) -> None:
+        """
+        Args:
+            data: the kinds of data to share, ``CurlLockData.SSL_SESSION`` by
+                default.
+        """
+        self._share: Any = None
+        self._locks: Any = None
+        share = lib.curl_share_init()
+        if share == ffi.NULL:
+            raise CurlError("Failed to create share handle")
+        locks = lib._curl_share_locks_new()
+        if locks == ffi.NULL:
+            lib.curl_share_cleanup(share)
+            raise CurlError("Failed to create share locks")
+        self._share = share
+        self._locks = locks
+        self._check(lib._curl_share_setopt_locks(share, locks), "set share locks")
+        for kind in data:
+            self.setopt(CurlShOpt.SHARE, kind)
+
+    def _check(self, code: int, *args: Any) -> None:
+        if code != CurlShECode.OK:
+            msg = ffi.string(lib.curl_share_strerror(code)).decode()
+            action = " ".join(str(a) for a in args)
+            raise CurlError(
+                f"Failed to {action}, curl share: ({code}) {msg}", code=code
+            )
+
+    def _handle(self) -> Any:
+        if self._share is None:
+            raise CurlError("Cannot use a closed share.")
+        return self._share
+
+    def setopt(self, option: CurlShOpt, value: CurlLockData | int) -> None:
+        """Wrapper for ``curl_share_setopt``: start (``CurlShOpt.SHARE``) or
+        stop (``CurlShOpt.UNSHARE``) sharing a kind of data.
+
+        Args:
+            option: ``CurlShOpt.SHARE`` or ``CurlShOpt.UNSHARE``.
+            value: the kind of data, a ``CurlLockData``.
+        """
+        if option not in (CurlShOpt.SHARE, CurlShOpt.UNSHARE):
+            raise NotImplementedError(f"Share option unsupported: {option}")
+        code = lib.curl_share_setopt(self._handle(), option, ffi.cast("int", value))
+        self._check(code, "setopt", option, value)
+
+    def close(self) -> None:
+        """Wrapper for ``curl_share_cleanup``. The handles attached to the
+        share must be closed first, otherwise this raises and the share stays
+        usable."""
+        if self._share is None:
+            return
+        self._check(lib.curl_share_cleanup(self._share), "close share")
+        self._share = None
+        lib._curl_share_locks_free(self._locks)
+        self._locks = None
+
+    @property
+    def closed(self) -> bool:
+        return self._share is None
+
+    def __enter__(self) -> CurlShare:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Attached handles keep a reference, so normally none is left by now;
+        # when they are collected together, a share still in use is leaked.
+        if self._share is not None:
+            with suppress(Exception):
+                self.close()
 
 
 class CurlMime:
