@@ -1,0 +1,376 @@
+socks: SOCKS5 UDP ASSOCIATE robustness (fixed QUIC path, batched relay datagrams, unroutable relay address, drop malformed datagrams)
+
+diff --git a/lib/socks.c b/lib/socks.c
+index 2c6dca6..8f6cf60 100644
+--- a/lib/socks.c
++++ b/lib/socks.c
+@@ -133,6 +133,12 @@ struct socks_ctx {
+   BIT(udp_associate); /* use UDP ASSOCIATE instead of CONNECT */
+   BIT(udp_dest_set); /* destination cached for UDP headers */
+   BIT(udp_peer_set); /* udp_peer_addr is available */
++  unsigned char *udp_batch; /* relayed datagram(s) not yet passed up */
++  size_t udp_batch_len;
++  size_t udp_batch_off; /* start of the next datagram in udp_batch */
++  size_t udp_batch_seg; /* segment size of a batch, 0 for one datagram */
++  BIT(udp_src_seen); /* first relayed datagram was traced */
++  BIT(udp_batch_seen); /* splitting batches was traced */
+ };
+ 
+ #if defined(HAVE_GSSAPI) || defined(USE_WINDOWS_SSPI)
+@@ -1177,8 +1183,8 @@ static CURLproxycode socks5_udp_set_relay(struct socks_ctx *sx,
+     failf(data, "SOCKS5 UDP relay returned port 0");
+     return CURLPX_BAD_ADDRESS_TYPE;
+   }
+-  if(!curlx_inet_ntop(sx->udp_relay_family, sx->udp_relay_addr,
+-                      addrbuf, sizeof(addrbuf)))
++  if(curlx_inet_ntop(sx->udp_relay_family, sx->udp_relay_addr,
++                     addrbuf, sizeof(addrbuf)))
+     strcpy(addrbuf, "unknown");
+   infof(data, "SOCKS5 UDP relay is %s:%d", addrbuf,
+         sx->udp_relay_port);
+@@ -1343,6 +1349,52 @@ process_state:
+   }
+ }
+ 
++/* curl-impersonate: TRUE for loopback, private, CGNAT and link-local
++ * addresses, i.e. addresses that only mean something on the proxy's side of
++ * a NAT. */
++static bool socks5_addr_is_local(int family, const unsigned char *a)
++{
++  if(family == AF_INET)
++    return (a[0] == 10) || (a[0] == 127) ||
++           ((a[0] == 172) && ((a[1] & 0xf0) == 16)) ||
++           ((a[0] == 192) && (a[1] == 168)) ||
++           ((a[0] == 169) && (a[1] == 254)) ||
++           ((a[0] == 100) && ((a[1] & 0xc0) == 64));
++#ifdef USE_IPV6
++  if(family == AF_INET6) {
++    static const unsigned char loopback[16] = {
++      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
++    static const unsigned char v4mapped[12] = {
++      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
++    if(!memcmp(a, v4mapped, sizeof(v4mapped)))
++      return socks5_addr_is_local(AF_INET, a + 12);
++    return !memcmp(a, loopback, sizeof(loopback)) ||
++           ((a[0] & 0xfe) == 0xfc) ||                /* fc00::/7 */
++           ((a[0] == 0xfe) && ((a[1] & 0xc0) == 0x80)); /* fe80::/10 */
++  }
++#endif
++  return FALSE;
++}
++
++static bool socks5_sockaddr_is_local(const struct Curl_sockaddr_ex *addr)
++{
++  if(addr->family == AF_INET) {
++    const struct sockaddr_in *sa =
++      (const struct sockaddr_in *)(const void *)&addr->curl_sa_addr;
++    return socks5_addr_is_local(AF_INET,
++                                (const unsigned char *)&sa->sin_addr);
++  }
++#ifdef USE_IPV6
++  if(addr->family == AF_INET6) {
++    const struct sockaddr_in6 *sa6 =
++      (const struct sockaddr_in6 *)(const void *)&addr->curl_sa_addr;
++    return socks5_addr_is_local(AF_INET6,
++                                (const unsigned char *)&sa6->sin6_addr);
++  }
++#endif
++  return FALSE;
++}
++
+ /* curl-impersonate: create the UDP relay data path while retaining the TCP
+  * control channel required for the lifetime of the association. */
+ static CURLcode socks5_udp_create(struct Curl_cfilter *cf,
+@@ -1369,10 +1421,21 @@ static CURLcode socks5_udp_create(struct Curl_cfilter *cf,
+       break;
+     }
+   }
+-  /* If the relay address is 0.0.0.0 or ::, reuse the proxy's TCP peer. */
+-  if(is_zero && cf->next &&
+-     !cf->next->cft->query(cf->next, data, CF_QUERY_REMOTE_ADDR,
+-                           &dummy, &proxy_addr) && proxy_addr) {
++  if(cf->next &&
++     cf->next->cft->query(cf->next, data, CF_QUERY_REMOTE_ADDR,
++                          &dummy, &proxy_addr))
++    proxy_addr = NULL;
++  /* If the relay address is 0.0.0.0 or ::, reuse the proxy's TCP peer. The
++   * same goes for a private or loopback relay address announced by a proxy
++   * we reach over a public address: such relays sit behind a NAT and the
++   * address is not reachable from here. */
++  if(proxy_addr &&
++     (is_zero ||
++      (socks5_addr_is_local(sx->udp_relay_family, sx->udp_relay_addr) &&
++       !socks5_sockaddr_is_local(proxy_addr)))) {
++    if(!is_zero)
++      infof(data, "SOCKS5 UDP relay address is not routable, "
++            "using the proxy address instead");
+     if(proxy_addr->family == AF_INET) {
+       const struct sockaddr_in *sa =
+         (const struct sockaddr_in *)(const void *)&proxy_addr->curl_sa_addr;
+@@ -1437,6 +1500,7 @@ static void socks_proxy_ctx_free(struct socks_ctx *ctx,
+   if(ctx) {
+     if(ctx->tcp_cf)
+       Curl_conn_cf_discard_chain(&ctx->tcp_cf, data);
++    curlx_free(ctx->udp_batch);
+     Curl_peer_unlink(&ctx->dest);
+     Curl_creds_unlink(&ctx->creds);
+     Curl_bufq_free(&ctx->iobuf);
+@@ -1603,42 +1667,49 @@ static CURLcode socks_proxy_cf_send(struct Curl_cfilter *cf,
+   return CURLE_OK;
+ }
+ 
+-/* curl-impersonate: strip SOCKS5 UDP headers before passing QUIC payloads
+- * upward. */
+-static CURLcode socks_proxy_cf_recv(struct Curl_cfilter *cf,
+-                                    struct Curl_easy *data,
+-                                    char *buf, size_t len, size_t *pnread)
++/* curl-impersonate: show what the relay writes into the reply header. */
++static void socks5_udp_trace_src(struct Curl_cfilter *cf,
++                                 struct Curl_easy *data,
++                                 unsigned char atyp,
++                                 const unsigned char *addr, int port)
+ {
+-  struct socks_ctx *sx = cf->ctx;
+-  const size_t max_header = SOCKS5_HEADER_LEN + 1 + 255 + SOCKS5_PORT_LEN;
+-  unsigned char *packet;
+-  size_t packet_len;
+-  size_t addrlen;
+-  size_t offset;
+-  size_t nread = 0;
+-  CURLcode result;
+-
+-  *pnread = 0;
+-  if(!sx || !sx->udp_associate)
+-    return Curl_cf_def_recv(cf, data, buf, len, pnread);
+-  if(len > SIZE_MAX - max_header)
+-    return CURLE_OUT_OF_MEMORY;
+-  packet_len = len + max_header;
+-  packet = curlx_malloc(packet_len);
+-  if(!packet)
+-    return CURLE_OUT_OF_MEMORY;
++#ifdef CURLVERBOSE
++  char buf[MAX_IPADR_LEN];
+ 
+-  result = cf->next->cft->do_recv(cf->next, data, (char *)packet,
+-                                  packet_len, &nread);
+-  if(result)
+-    goto out;
+-  if(nread < SOCKS5_HEADER_LEN || packet[0] || packet[1] || packet[2]) {
+-    result = CURLE_RECV_ERROR;
+-    goto out;
++  if(!Curl_trc_cf_is_verbose(cf, data))
++    return;
++  if(atyp == SOCKS5_ATYP_DOMAIN) {
++    size_t n = CURLMIN((size_t)addr[0], sizeof(buf) - 1);
++    memcpy(buf, &addr[1], n);
++    buf[n] = 0;
+   }
++  else if(curlx_inet_ntop((atyp == SOCKS5_ATYP_IPV4) ? AF_INET :
++#ifdef USE_IPV6
++                           AF_INET6,
++#else
++                           AF_INET,
++#endif
++                           addr, buf, sizeof(buf)))
++    strcpy(buf, "?");
++  CURL_TRC_CF(data, cf, "SOCKS5 UDP relay reply source %s:%d", buf, port);
++#else
++  (void)cf;
++  (void)data;
++  (void)atyp;
++  (void)addr;
++  (void)port;
++#endif
++}
+ 
+-  offset = SOCKS5_HEADER_LEN;
+-  switch(packet[3]) {
++/* curl-impersonate: length of the SOCKS5 UDP header at `p`, 0 if there is
++ * none we accept. Fragments (FRAG != 0) are not supported. */
++static size_t socks5_udp_header_len(const unsigned char *p, size_t len)
++{
++  size_t addrlen;
++
++  if((len < SOCKS5_HEADER_LEN) || p[0] || p[1] || p[2])
++    return 0;
++  switch(p[3]) {
+   case SOCKS5_ATYP_IPV4:
+     addrlen = SOCKS5_IPV4_LEN;
+     break;
+@@ -1648,53 +1719,130 @@ static CURLcode socks_proxy_cf_recv(struct Curl_cfilter *cf,
+     break;
+ #endif
+   case SOCKS5_ATYP_DOMAIN:
+-    if(nread < SOCKS5_HEADER_LEN + 1) {
+-      result = CURLE_RECV_ERROR;
+-      goto out;
+-    }
+-    addrlen = 1 + packet[SOCKS5_HEADER_LEN];
++    if(len < SOCKS5_HEADER_LEN + 1)
++      return 0;
++    addrlen = 1 + (size_t)p[SOCKS5_HEADER_LEN];
+     break;
+   default:
+-    result = CURLE_RECV_ERROR;
+-    goto out;
++    return 0;
+   }
+-  if(nread < offset + addrlen + SOCKS5_PORT_LEN) {
+-    result = CURLE_RECV_ERROR;
+-    goto out;
++  if(len < SOCKS5_HEADER_LEN + addrlen + SOCKS5_PORT_LEN)
++    return 0;
++  return SOCKS5_HEADER_LEN + addrlen + SOCKS5_PORT_LEN;
++}
++
++/* curl-impersonate: some relays hand over a batch of datagrams (GSO
++ * segments) as one oversized UDP datagram. Each segment is a complete SOCKS5
++ * UDP datagram from the same source, so it starts with the same header, and
++ * all segments but the last have the same size. Return that size, or 0 when
++ * `p` holds a single datagram. */
++static size_t socks5_udp_segment_size(const unsigned char *p, size_t len,
++                                      size_t hlen)
++{
++  size_t seg, off;
++
++  for(seg = hlen + 1; seg + hlen <= len; seg++) {
++    if(memcmp(p + seg, p, hlen))
++      continue;
++    for(off = 2 * seg; off < len; off += seg) {
++      if((len - off < hlen) || memcmp(p + off, p, hlen))
++        break;
++    }
++    if(off >= len)
++      return seg;
+   }
++  return 0;
++}
+ 
+-  /* For socks5h with a domain target, leave udp_peer_set false so the socket
+-   * filter reports the relay as QUIC's network peer. For locally resolved
+-   * targets and IP literals, cache the source address from the UDP header. */
+-  if((packet[3] == SOCKS5_ATYP_IPV4
+-#ifdef USE_IPV6
+-      || packet[3] == SOCKS5_ATYP_IPV6
+-#endif
+-     ) &&
+-     sx->udp_dest_atyp != SOCKS5_ATYP_DOMAIN) {
+-    int port = (int)((packet[offset + addrlen] << 8) |
+-                     packet[offset + addrlen + 1]);
+-#ifdef USE_IPV6
+-    socks5_udp_set_peer(sx,
+-                        packet[3] == SOCKS5_ATYP_IPV4 ? AF_INET : AF_INET6,
+-                        &packet[offset], port);
+-#else
+-    socks5_udp_set_peer(sx, AF_INET, &packet[offset], port);
+-#endif
++/* curl-impersonate: strip SOCKS5 UDP headers before passing QUIC payloads
++ * upward, one datagram per call. */
++static CURLcode socks_proxy_cf_recv(struct Curl_cfilter *cf,
++                                    struct Curl_easy *data,
++                                    char *buf, size_t len, size_t *pnread)
++{
++  struct socks_ctx *sx = cf->ctx;
++  const size_t max_header = SOCKS5_HEADER_LEN + 1 + 255 + SOCKS5_PORT_LEN;
++  const unsigned char *p;
++  size_t left, seg_len, hlen;
++
++  *pnread = 0;
++  if(!sx || !sx->udp_associate)
++    return Curl_cf_def_recv(cf, data, buf, len, pnread);
++
++  if(!sx->udp_batch) {
++    unsigned char *packet;
++    size_t packet_len, nread = 0;
++    CURLcode result;
++
++    if(len > SIZE_MAX - max_header)
++      return CURLE_OUT_OF_MEMORY;
++    packet_len = len + max_header;
++    packet = curlx_malloc(packet_len);
++    if(!packet)
++      return CURLE_OUT_OF_MEMORY;
++    result = cf->next->cft->do_recv(cf->next, data, (char *)packet,
++                                    packet_len, &nread);
++    if(result) {
++      curlx_free(packet);
++      return result;
++    }
++    hlen = socks5_udp_header_len(packet, nread);
++    if(!hlen) {
++      /* RFC 1928: drop what we cannot use instead of failing the
++       * connection, e.g. fragments or stray datagrams. */
++      CURL_TRC_CF(data, cf, "dropped SOCKS5 UDP datagram of %zu bytes",
++                  nread);
++      curlx_free(packet);
++      return CURLE_OK;
++    }
++
++    /* curl-impersonate: an association carries a single destination, so
++     * the QUIC path stays the one the connection started with. Relays
++     * differ in what they put into the reply header (the origin, themselves,
++     * zeros, an IPv4-mapped address or a name); following it would make
++     * ngtcp2 drop the packets as coming from an unknown path. */
++    if(!sx->udp_src_seen) {
++      sx->udp_src_seen = TRUE;
++      socks5_udp_trace_src(cf, data, packet[3], &packet[SOCKS5_HEADER_LEN],
++                           (int)((packet[hlen - 2] << 8) | packet[hlen - 1]));
++    }
++
++    sx->udp_batch = packet;
++    sx->udp_batch_len = nread;
++    sx->udp_batch_off = 0;
++    sx->udp_batch_seg = socks5_udp_segment_size(packet, nread, hlen);
++    if(sx->udp_batch_seg && !sx->udp_batch_seen) {
++      sx->udp_batch_seen = TRUE;
++      infof(data, "SOCKS5 UDP relay batches datagrams of %zu bytes, "
++            "splitting them", sx->udp_batch_seg);
++    }
+   }
+ 
+-  offset += addrlen + SOCKS5_PORT_LEN;
+-  if(nread > offset) {
+-    size_t payload_len = nread - offset;
+-    if(payload_len > len)
+-      payload_len = len;
+-    memcpy(buf, &packet[offset], payload_len);
++  p = sx->udp_batch + sx->udp_batch_off;
++  left = sx->udp_batch_len - sx->udp_batch_off;
++  seg_len = sx->udp_batch_seg ? CURLMIN(sx->udp_batch_seg, left) : left;
++  hlen = socks5_udp_header_len(p, seg_len);
++  if(hlen && (seg_len > hlen)) {
++    size_t payload_len = CURLMIN(seg_len - hlen, len);
++    memcpy(buf, p + hlen, payload_len);
+     *pnread = payload_len;
+   }
++  sx->udp_batch_off += seg_len;
++  if(sx->udp_batch_off >= sx->udp_batch_len) {
++    curlx_free(sx->udp_batch);
++    sx->udp_batch = NULL;
++  }
++  return CURLE_OK;
++}
+ 
+-out:
+-  curlx_free(packet);
+-  return result;
++static bool socks_cf_data_pending(struct Curl_cfilter *cf,
++                                  const struct Curl_easy *data)
++{
++  struct socks_ctx *sx = cf->ctx;
++
++  if(sx && sx->udp_batch)
++    return TRUE;
++  return Curl_cf_def_data_pending(cf, data);
+ }
+ 
+ static CURLcode socks_cf_adjust_pollset(struct Curl_cfilter *cf,
+@@ -1776,7 +1924,7 @@ struct Curl_cftype Curl_cft_socks_proxy = {
+   socks_proxy_cf_connect,
+   Curl_cf_def_shutdown,
+   socks_cf_adjust_pollset,
+-  Curl_cf_def_data_pending,
++  socks_cf_data_pending,
+   socks_proxy_cf_send,
+   socks_proxy_cf_recv,
+   Curl_cf_def_cntrl,

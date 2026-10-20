@@ -1,0 +1,172 @@
+conn: add nghttp3_conn_submit_grease_frame
+
+diff --git a/lib/includes/nghttp3/nghttp3.h b/lib/includes/nghttp3/nghttp3.h
+index 62c2c70..7e89037 100644
+--- a/lib/includes/nghttp3/nghttp3.h
++++ b/lib/includes/nghttp3/nghttp3.h
+@@ -2459,6 +2459,32 @@ NGHTTP3_EXTERN int nghttp3_conn_bind_qpack_streams(nghttp3_conn *conn,
+                                                    int64_t qenc_stream_id,
+                                                    int64_t qdec_stream_id);
+ 
++/**
++ * @function
++ *
++ * `nghttp3_conn_submit_grease_frame` queues a frame of the reserved type
++ * |type| (0x1f * N + 0x21, see :rfc:`9114` section 7.2.8) carrying the
++ * |datalen| bytes pointed by |data| on the control stream, after the
++ * frames already queued there.  |datalen| must not exceed 8.
++ *
++ * This function must be called after
++ * `nghttp3_conn_bind_control_stream`.
++ *
++ * This function returns 0 if it succeeds, or one of the following
++ * negative error codes:
++ *
++ * :macro:`NGHTTP3_ERR_INVALID_ARGUMENT`
++ *     |type| is not a reserved frame type, or |datalen| is too large.
++ * :macro:`NGHTTP3_ERR_INVALID_STATE`
++ *     Control stream has not been bound.
++ * :macro:`NGHTTP3_ERR_NOMEM`
++ *     Out of memory.
++ */
++NGHTTP3_EXTERN int nghttp3_conn_submit_grease_frame(nghttp3_conn *conn,
++                                                    uint64_t type,
++                                                    const uint8_t *data,
++                                                    size_t datalen);
++
+ /**
+  * @function
+  *
+diff --git a/lib/nghttp3_conn.c b/lib/nghttp3_conn.c
+index 0c2d4f3..af193ab 100644
+--- a/lib/nghttp3_conn.c
++++ b/lib/nghttp3_conn.c
+@@ -2238,6 +2238,31 @@ int nghttp3_conn_submit_settings(nghttp3_conn *conn, uint8_t flags,
+   return 0;
+ }
+ 
++int nghttp3_conn_submit_grease_frame(nghttp3_conn *conn, uint64_t type,
++                                     const uint8_t *data, size_t datalen) {
++  nghttp3_frame fr;
++
++  if (type < 0x21 || type > NGHTTP3_MAX_VARINT || (type - 0x21) % 0x1f ||
++      datalen > sizeof(fr.grease.data) || (datalen && data == NULL)) {
++    return NGHTTP3_ERR_INVALID_ARGUMENT;
++  }
++
++  if (conn->tx.ctrl == NULL) {
++    return NGHTTP3_ERR_INVALID_STATE;
++  }
++
++  fr.grease = (nghttp3_frame_grease){
++    .type = NGHTTP3_FRAME_GREASE_INTERNAL,
++    .wire_type = (int64_t)type,
++    .datalen = datalen,
++  };
++  if (datalen) {
++    memcpy(fr.grease.data, data, datalen);
++  }
++
++  return nghttp3_stream_frq_add(conn->tx.ctrl, &fr);
++}
++
+ int nghttp3_conn_bind_qpack_streams(nghttp3_conn *conn, int64_t qenc_stream_id,
+                                     int64_t qdec_stream_id) {
+   nghttp3_stream *stream;
+diff --git a/lib/nghttp3_frame.h b/lib/nghttp3_frame.h
+index 948e539..b70853b 100644
+--- a/lib/nghttp3_frame.h
++++ b/lib/nghttp3_frame.h
+@@ -114,6 +114,17 @@ typedef struct nghttp3_frame_priority_update {
+   };
+ } nghttp3_frame_priority_update;
+ 
++/* curl-impersonate: internal type of a reserved (GREASE) frame queued on the
++   control stream; the type sent on the wire is wire_type. */
++#define NGHTTP3_FRAME_GREASE_INTERNAL (-1)
++
++typedef struct nghttp3_frame_grease {
++  int64_t type;
++  int64_t wire_type;
++  size_t datalen;
++  uint8_t data[8];
++} nghttp3_frame_grease;
++
+ typedef struct nghttp3_frame_origin {
+   int64_t type;
+   /* These fields are only used by server to send ORIGIN frame.
+@@ -129,6 +140,7 @@ typedef union nghttp3_frame {
+   nghttp3_frame_goaway goaway;
+   nghttp3_frame_priority_update priority_update;
+   nghttp3_frame_origin origin;
++  nghttp3_frame_grease grease;
+ } nghttp3_frame;
+ 
+ /*
+diff --git a/lib/nghttp3_stream.c b/lib/nghttp3_stream.c
+index eab2893..7eb55d0 100644
+--- a/lib/nghttp3_stream.c
++++ b/lib/nghttp3_stream.c
+@@ -298,6 +298,12 @@ int nghttp3_stream_fill_outq(nghttp3_stream *stream) {
+         return rv;
+       }
+ 
++      break;
++    case NGHTTP3_FRAME_GREASE_INTERNAL:
++      rv = nghttp3_stream_write_grease(stream, &fr->grease);
++      if (rv != 0) {
++        return rv;
++      }
+       break;
+     default:
+       /* TODO Not implemented */
+@@ -422,6 +428,35 @@ int nghttp3_stream_write_goaway(nghttp3_stream *stream,
+   return nghttp3_stream_outq_add(stream, &tbuf);
+ }
+ 
++int nghttp3_stream_write_grease(nghttp3_stream *stream,
++                                const nghttp3_frame_grease *fr) {
++  size_t len;
++  int rv;
++  nghttp3_buf *chunk;
++  nghttp3_typed_buf tbuf;
++
++  len = nghttp3_frame_write_hd_len(fr->wire_type, (int64_t)fr->datalen) +
++        fr->datalen;
++
++  rv = nghttp3_stream_ensure_chunk(stream, len);
++  if (rv != 0) {
++    return rv;
++  }
++
++  chunk = nghttp3_stream_get_chunk(stream);
++  nghttp3_typed_buf_shared_init(&tbuf, chunk);
++
++  chunk->last =
++    nghttp3_frame_write_hd(chunk->last, fr->wire_type, (int64_t)fr->datalen);
++  if (fr->datalen) {
++    chunk->last = nghttp3_cpymem(chunk->last, fr->data, fr->datalen);
++  }
++
++  tbuf.buf.last = chunk->last;
++
++  return nghttp3_stream_outq_add(stream, &tbuf);
++}
++
+ int nghttp3_stream_write_priority_update(
+   nghttp3_stream *stream, const nghttp3_frame_priority_update *fr) {
+   size_t len;
+diff --git a/lib/nghttp3_stream.h b/lib/nghttp3_stream.h
+index 20fa421..8913e01 100644
+--- a/lib/nghttp3_stream.h
++++ b/lib/nghttp3_stream.h
+@@ -295,6 +295,9 @@ int nghttp3_stream_write_settings(nghttp3_stream *stream,
+ int nghttp3_stream_write_goaway(nghttp3_stream *stream,
+                                 const nghttp3_frame_goaway *fr);
+ 
++int nghttp3_stream_write_grease(nghttp3_stream *stream,
++                                const nghttp3_frame_grease *fr);
++
+ int nghttp3_stream_write_priority_update(
+   nghttp3_stream *stream, const nghttp3_frame_priority_update *fr);
+ 
