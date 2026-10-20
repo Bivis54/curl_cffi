@@ -57,6 +57,23 @@ struct CURLMsg *curl_multi_info_read(void* curlm, int *msg_in_queue);
 extern "Python" int socket_function(void *curl, int sockfd, int what, void *clientp, void *socketp);
 extern "Python" int timer_function(void *curlm, int timeout_ms, void *clientp);
 
+// share interfaces
+typedef enum { ... } CURLSHcode;
+typedef enum { ... } CURLSHoption;
+void *curl_share_init();
+CURLSHcode curl_share_setopt(void *share, CURLSHoption option, ...);
+CURLSHcode curl_share_cleanup(void *share);
+const char *curl_share_strerror(CURLSHcode code);
+void *_curl_share_locks_new(void);
+void _curl_share_locks_free(void *locks);
+int _curl_share_setopt_locks(void *share, void *locks);
+
+// permessage-deflate with Chromium's zlib
+void *_ws_deflater_new(int window_bits, int no_context_takeover);
+int _ws_deflate(void *deflater, const unsigned char *data, size_t len, unsigned char **out, size_t *out_len);
+void _ws_deflate_free_buffer(unsigned char *buffer);
+void _ws_deflater_free(void *deflater);
+
 // websocket
 struct curl_ws_frame {
   int age;              /* zero */

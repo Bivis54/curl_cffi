@@ -306,6 +306,33 @@ def inflate(payloads: list[bytes], window_bits: int, shared: bool) -> list[bytes
     return out
 
 
+# What Google Chrome 155.0.8059.84 sent for three such text messages, an 8-byte
+# binary one and an empty one (a local browser capture).
+CHROME_TEXT = b'{"type":"quote","pair":"EURUSD","bid":1.08421,"ask":1.08425}' * 4
+CHROME_FIRST = bytes.fromhex(
+    "aa562aa92c4855b2522a2ccd2f4955d2512a48cc2c52b252720d0d0a0d7651d2514aca4c51"
+    "b232d433b0303132d4514a2cce86f14c6bab87a05e0000"
+)
+CHROME_REPEAT = bytes.fromhex("1a697a0100")
+CHROME_BINARY = bytes.fromhex("62646266616563e70000")
+
+
+@pytest.mark.parametrize(
+    "params, payloads",
+    [
+        ((15, False), [CHROME_FIRST, CHROME_REPEAT, CHROME_REPEAT]),
+        ((15, True), [CHROME_FIRST, CHROME_FIRST, CHROME_FIRST]),
+        ((10, False), [CHROME_FIRST, CHROME_REPEAT, CHROME_REPEAT]),
+    ],
+)
+def test_deflate_like_chrome(params: tuple[int, bool], payloads: list[bytes]):
+    ws = WebSocket()
+    ws._deflate_params = params
+    messages = [CHROME_TEXT] * 3 + [bytes(range(1, 9)), b""]
+    got = [ws._deflate(m) for m in messages]
+    assert got == payloads + [CHROME_BINARY, b"\x00"]
+
+
 @pytest.mark.parametrize("window_bits", [8, 10, 15])
 @pytest.mark.parametrize("no_context_takeover", [False, True])
 def test_deflate_streams(window_bits: int, no_context_takeover: bool):
