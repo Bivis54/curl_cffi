@@ -618,8 +618,10 @@ class CurlWsFlag(IntEnum):
     OFFSET = 1 << 5
     PONG = 1 << 6
     # Set on receive when the frame carried RSV1, i.e. a permessage-deflate
-    # compressed payload (RFC 7692). Requires a libcurl built with the
-    # websocket-deflate patch; vanilla libcurl rejects RSV1 outright.
+    # compressed payload (RFC 7692). On send it sets RSV1 on the first frame of
+    # a TEXT or BINARY message whose payload is already compressed. Requires a
+    # libcurl built with the websocket-deflate patches; vanilla libcurl rejects
+    # RSV1 outright.
     DEFLATE = 1 << 7
 
 
