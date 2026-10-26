@@ -25,7 +25,43 @@ mkdir -p "$out" "$install_dir"
 git clone --quiet --depth 1 --branch "$CURL_IMPERSONATE_REF" \
   "$CURL_IMPERSONATE_REPO" "$src"
 
-for dep in curl ngtcp2 nghttp3 boringssl; do
+# Security backports: pull vulnerable bundled dependencies up to patched
+# releases. curl-impersonate pins each dependency's version and archive hash
+# in its CMakeLists.txt, so rewrite those two lines before the build fetches
+# the sources. Fail loudly if a pin is not found, so a silent fall back to the
+# vulnerable version cannot happen.
+bump_dependency() {
+  local name=$1 version=$2 hash=$3 cml="$src/CMakeLists.txt"
+  grep -q "set(${name}_VERSION \"" "$cml" || {
+    echo "no ${name}_VERSION pin in $cml" >&2; exit 1; }
+  sed -i \
+    -e "s|set(${name}_VERSION \"[^\"]*\")|set(${name}_VERSION \"${version}\")|" \
+    -e "s|set(${name}_URL_HASH \"[^\"]*\")|set(${name}_URL_HASH \"SHA256=${hash}\")|" \
+    "$cml"
+  grep -q "set(${name}_VERSION \"${version}\")" "$cml" || {
+    echo "failed to set ${name}_VERSION to ${version}" >&2; exit 1; }
+  echo "bumped ${name} to ${version}"
+}
+# brotli 1.2.1 (CVE-2026-111497) and c-ares 1.34.9 are pure version bumps.
+# nghttp2 and ngtcp2 keep their pinned versions so the HTTP/2 and QUIC output
+# stays byte-identical: nghttp2 1.68.1 would adopt the shared sfparse symbol
+# names that collide with nghttp3 1.15.0 at static link time, so CVE-2026-27135
+# and the ngtcp2 qlog overflow (CVE-2026-40170) are carried as patches instead.
+bump_dependency BROTLI 1.2.1 \
+  98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f
+bump_dependency CARES 1.34.9 \
+  9364b70a12eb59a06830fb488d9357f90100dff0d98b23ea3593a183d43e6f2f
+
+# curl-impersonate applies patches/<dep>.patch for these deps but not for
+# nghttp2, so add a patch step to its nghttp2 ExternalProject. The marker line
+# is unique to the nghttp2 block (nghttp3 uses a different source dir).
+sed -i \
+  's|SOURCE_DIR "${DEPS_SRC_DIR}/nghttp2"|&\n  PATCH_COMMAND ${PATCH_EXE} -p1 -i "${CMAKE_SOURCE_DIR}/patches/nghttp2.patch"|' \
+  "$src/CMakeLists.txt"
+grep -q 'patches/nghttp2.patch' "$src/CMakeLists.txt" || {
+  echo "failed to add nghttp2 PATCH_COMMAND" >&2; exit 1; }
+
+for dep in curl nghttp2 ngtcp2 nghttp3 boringssl; do
   for p in "$root"/native/patches/"$dep"/*.patch; do
     [[ -e "$p" ]] || continue
     echo "appending $(basename "$p") to patches/$dep.patch"
