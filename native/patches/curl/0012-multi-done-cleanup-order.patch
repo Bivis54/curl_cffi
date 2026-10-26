@@ -1,0 +1,46 @@
+multi: adjust the cleanup order in multi_done (CVE-2026-92392)
+
+Backport of curl commit 8b0744af5b1b631da5b938ca31c3f9895ad5a321 to 8.22.0.
+multi_done() told the connection filters the transfer was done and scheduled
+pending transfers before the request was finished and the connection detached,
+so a filter could still reference the easy handle while another transfer was
+activated on the same connection, a use-after-free on HTTP/2 uploads.
+
+Inform the filters only once the connection is about to be returned to the
+pool, and schedule pending transfers after that. 8.22.0 detaches the
+connection inside multi_done_locked under the pool lock rather than through
+Curl_cpool_return, so the reordering is adapted to that flow.
+
+diff --git a/lib/multi.c b/lib/multi.c
+--- a/lib/multi.c
++++ b/lib/multi.c
+@@ -737,12 +737,6 @@
+   /* Make sure that transfer client writes are really done now. */
+   result = Curl_1st_fatal(result, Curl_xfer_write_done(data, premature));
+ 
+-  /* Inform connection filters that this transfer is done */
+-  if(conn)
+-    Curl_conn_ev_data_done(data, premature);
+-
+-  multi_schedule_pending(data->multi); /* connection / multiplex */
+-
+   if(!result)
+     result = Curl_req_done(&data->req, data, premature);
+ 
+@@ -751,9 +745,16 @@
+      * do with the transfer's connection. */
+     struct multi_done_ctx mdctx;
+ 
++    /* Inform connection filters that this transfer is done and they
++     * need to give up any references to `data`. */
++    Curl_conn_ev_data_done(data, premature);
++
+     memset(&mdctx, 0, sizeof(mdctx));
+     mdctx.premature = premature;
+     Curl_cpool_do_locked(data, data->conn, multi_done_locked, &mdctx);
++
++    if(data->multi)
++      multi_schedule_pending(data->multi);
+   }
+ 
+   /* flush the netrc cache */

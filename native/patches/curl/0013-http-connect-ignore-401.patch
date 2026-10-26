@@ -1,0 +1,46 @@
+HTTP-CONNECT: do not react to 401 responses (CVE-2026-86414)
+
+Backport of curl commit 2956af6c7451029fb12c12f8166dff211f930d52 to 8.22.0,
+code changes only (the upstream test case is omitted). A malicious HTTP proxy
+could answer a CONNECT tunnel request with 401 WWW-Authenticate instead of
+407 Proxy-Authenticate and make libcurl send the origin's credentials to the
+proxy. Treat only a 407 with Proxy-Authenticate as a proxy challenge.
+
+diff --git a/lib/cf-h1-proxy.c b/lib/cf-h1-proxy.c
+--- a/lib/cf-h1-proxy.c
++++ b/lib/cf-h1-proxy.c
+@@ -307,8 +307,7 @@
+   CURLcode result = CURLE_OK;
+   struct SingleRequest *k = &data->req;
+ 
+-  if((checkprefix("WWW-Authenticate:", header) && (401 == k->httpcode)) ||
+-     (checkprefix("Proxy-authenticate:", header) && (407 == k->httpcode))) {
++  if(checkprefix("Proxy-authenticate:", header) && (407 == k->httpcode)) {
+ 
+     bool proxy = (k->httpcode == 407);
+     char *auth = Curl_copy_header_value(header);
+@@ -394,8 +393,7 @@
+   struct SingleRequest *k = &data->req;
+   (void)cf;
+ 
+-  if((checkprefix("WWW-Authenticate:", header) && (401 == k->httpcode)) ||
+-     (checkprefix("Proxy-authenticate:", header) && (407 == k->httpcode))) {
++  if(checkprefix("Proxy-authenticate:", header) && (407 == k->httpcode)) {
+ 
+     bool proxy = (k->httpcode == 407);
+     char *auth = Curl_copy_header_value(header);
+diff --git a/lib/http_proxy.c b/lib/http_proxy.c
+--- a/lib/http_proxy.c
++++ b/lib/http_proxy.c
+@@ -489,10 +489,7 @@
+       infof(data, "  %s: %s", entry->name, entry->value);
+   }
+ 
+-  if(resp->status == 401) {
+-    auth_reply = Curl_dynhds_cget(&resp->headers, "WWW-Authenticate");
+-  }
+-  else if(resp->status == 407) {
++  if(resp->status == 407) {
+     auth_reply = Curl_dynhds_cget(&resp->headers, "Proxy-Authenticate");
+   }
+ 
